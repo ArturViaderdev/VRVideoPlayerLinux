@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+# vr-play - 3D video player for VR headsets (OpenXR: WiVRn, SteamVR...).
+#
+#   vr-play pelicula.mkv                   formato automatico (por nombre y tamano)
+#   vr-play --full / --half pelicula.mkv   SBS completo / half SBS
+#   vr-play --tab / --htab pelicula.mkv    arriba/abajo completo / half
+#   vr-play --2d pelicula.mkv              video normal (2D) en la pantalla virtual
+#   vr-play --180 / --360 video.mp4        video VR de 180 / 360 grados (con --full/--tab/--2d: 3D o 2D)
+#   vr-play --flat video.mp4               no tratarlo como video VR aunque lo parezca
+#   vr-play /ruta/BLURAY  o  disco.iso     Blu-ray 3D desencriptado (MVC), sin recodificar
+#   vr-play /ruta/CARPETA                  todos los videos de la carpeta, en orden
+#   vr-play "https://youtube.com/..."      videos online 3D o VR (YouTube y todo lo que admita yt-dlp)
+#   --quality 4320|2160|1440|1080          calidad maxima de los videos online (por defecto 4320 = 8K)
+#   --probe                                solo detectar el formato (JSON), sin reproducir
+#   vr-play "https://deovr.com/..."        DeoVR y webs compatibles (enlace de video, JSON o deovr://)
+#   --deovr-list [URL]                     catalogo DeoVR en JSON (por defecto https://deovr.com/deovr)
+#   --deovr-login USUARIO                  iniciar sesion (contrasena: VR_DEOVR_PASSWORD, llavero o se pregunta)
+#   --deovr                                tratar el enlace como una web compatible con DeoVR
+#   --deovr-dump URL                       mostrar el JSON que devuelve la web (para diagnosticar)
+#   --swap                                 invertir ojos
+#   --sub FICHERO.srt / --sub-track N      subtitulos de texto, dentro de cada ojo
+#   --runtime auto|wivrn|steamvr|FICHERO.json   runtime OpenXR (por defecto el activo del sistema)
+#   --screen M  --distance M               tamano y distancia de la pantalla virtual (metros)
+#   --mode quad|render                     quad = capas por ojo (mejor); render = alternativo
+#   --alang=spa,eng                        idioma del audio del Blu-ray
+#   Cualquier otra --opcion va a mpv (--start=00:10:00, --aid=2, --volume=80...) o a vrvideo (--vr-*).
+#
+# Copyright (C) 2026 Artur Viader Mataix. GPLv3.
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+WINDOWS = os.name == "nt"
+VIDEO_EXT = (".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".webm", ".mpg", ".mpeg",
+             ".flv", ".3gp", ".ogv", ".vob")
+
+
+def log(msg):
+    print("vr-play: " + msg, file=sys.stderr, flush=True)
+
+
+def find_tool(name, local):
+    p = shutil.which(name)
+    if p:
+        return p
+    for c in local:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def vrvideo_path():
+    exe = "vrvideo.exe" if WINDOWS else "vrvideo"
+    return os.environ.get("VRVIDEO") or find_tool(exe, [os.path.join(HERE, "build", exe),
+                                                        os.path.join(HERE, "build", "Release", exe),
+                                                        os.path.join(HERE, exe)])
+
+
+def vrbd_path():
+    return find_tool("vr-bd", [os.path.join(HERE, "bluray", "vr-bd"), os.path.join(HERE, "vr-bd")])
+
+
+# ---------------------------------------------------------------------------------------------
+# OpenXR runtime
+# ---------------------------------------------------------------------------------------------
+def runtime_candidates(name):
+    home = os.path.expanduser("~")
+    if name == "wivrn":
+        flat = "app/io.github.wivrn.wivrn/current/active/files/share/openxr/1/openxr_wivrn.json"
+        return ["/usr/share/openxr/1/openxr_wivrn.json", "/usr/local/share/openxr/1/openxr_wivrn.json",
+                os.path.join(home, ".local/share/flatpak", flat), os.path.join("/var/lib/flatpak", flat)]
+    if name == "steamvr":
+        if WINDOWS:
+            return [r"C:\Program Files (x86)\Steam\steamapps\common\SteamVR\steamxr_win64.json"]
+        return [os.path.join(home, d, "steamapps/common/SteamVR/steamxr_linux64.json")
+                for d in (".steam/steam", ".local/share/Steam", ".steam/root",
+                          ".var/app/com.valvesoftware.Steam/data/Steam")]
+    return []
+
+
+def resolve_runtime(rt):
+    """XR_RUNTIME_JSON for --runtime (None = leave the system's active runtime)"""
+    if not rt or rt == "auto":
+        return None
+    if rt.endswith(".json"):
+        if not os.path.isfile(rt):
+            raise SystemExit("No existe el runtime: " + rt)
+        return rt
+    for c in runtime_candidates(rt):
+        if os.path.isfile(c):
+            return c
+    raise SystemExit("No encuentro el runtime OpenXR de %s (busque en: %s). Usa --runtime /ruta/al.json"
+                     % (rt, ", ".join(runtime_candidates(rt))))
+
+
+def active_runtime_name():
+    for d in [os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "/etc/xdg"]:
+        p = os.path.join(d, "openxr", "1", "active_runtime.json")
+        if os.path.isfile(p):
+            try:
+                with open(p) as f:
+                    r = json.load(f).get("runtime", {})
+                return "%s (%s)" % (r.get("name", "?"), os.path.realpath(p))
+            except (OSError, ValueError):
+                return p
+    return None
+
+
+# ---------------------------------------------------------------------------------------------
+# input
+# ---------------------------------------------------------------------------------------------
+def is_bluray(path):
+    if path.lower().endswith(".iso") and os.path.isfile(path):
+        return True
+    if os.path.isdir(path):
+        if os.path.basename(os.path.normpath(path)).upper() == "BDMV":
+            return os.path.isdir(os.path.join(path, "PLAYLIST"))
+        for sub in ("BDMV", "bdmv"):
+            if os.path.isdir(os.path.join(path, sub, "PLAYLIST")) or os.path.isdir(os.path.join(path, sub, "playlist")):
+                return True
+    return False
+
+
+def folder_videos(path):
+    out = []
+    for f in sorted(os.listdir(path), key=lambda s: s.lower()):
+        p = os.path.join(path, f)
+        if os.path.isfile(p) and f.lower().endswith(VIDEO_EXT):
+            out.append(p)
+    return out
+
+
+def probe(path, extra=(), timeout=30):
+    """(width, height, projection '180'/'360'/None, stereo 'sbs'/'tab'/'mono'/None) from the file's
+    metadata: VR cameras and YouTube downloads carry Spherical Mapping / Stereo 3D side data"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0, 0, None, None
+    try:
+        out = subprocess.run([ffprobe, "-v", "error"] + list(extra) + ["-select_streams", "v:0", "-show_streams",
+                                                                         "-of", "json", path],
+                             capture_output=True, text=True, timeout=timeout).stdout
+        st = json.loads(out)["streams"][0]
+    except (OSError, ValueError, IndexError, KeyError, subprocess.SubprocessError):
+        return 0, 0, None, None
+    w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+    proj = stereo = None
+    for sd in st.get("side_data_list") or []:
+        t = (sd.get("side_data_type") or "").lower()
+        if "spherical" in t and "equirect" in str(sd.get("projection", "")).lower():
+            # bounds are 0.32 fixed point: a 180 video leaves out a quarter on each side
+            l, r = int(sd.get("bound_left") or 0), int(sd.get("bound_right") or 0)
+            covered = 360.0 * (1 - (l + r) / 4294967296.0)
+            proj = "180" if covered < 270 else "360"
+        elif "stereo" in t:
+            ty = str(sd.get("type", "")).lower()
+            stereo = "sbs" if "side" in ty else "tab" if ("top" in ty or "bottom" in ty) else "mono" if "2d" in ty else None
+    return w, h, proj, stereo
+
+
+def vr_from_name(name):
+    """projection and stereo layout from VR naming conventions: _180_LR, _360_TB, VR180, 180x180_3dh..."""
+    toks = [t for t in re.split(r"[^A-Z0-9]+", name.upper()) if t]
+    proj = None
+    for t in toks:
+        if t in ("180", "VR180") or t.startswith("180X") or t.endswith("VR180"):
+            proj = "180"
+        elif t in ("360", "VR360") or t.startswith("360X") or t.endswith("VR360"):
+            proj = "360"
+    stereo = None
+    for t in toks:
+        if t in ("LR", "RL", "SBS", "3DH", "SIDEBYSIDE") or t.endswith("3DH") or t.endswith("LR"):
+            stereo = "sbs"
+        elif t in ("TB", "BT", "OU", "TAB", "3DV", "OVERUNDER") or t.endswith("3DV") or t.endswith("TB"):
+            stereo = "tab"
+        elif t in ("MONO", "2D"):
+            stereo = "mono"
+    return proj, stereo
+
+
+def vr_layout_from_size(proj, w, h):
+    """eye layout of a VR video from its frame shape (180 eye 1:1, 360 eye 2:1)"""
+    if w <= 0 or h <= 0:
+        return "sbs" if proj == "180" else "tab"
+    r = w / float(h)
+    eye = 1.0 if proj == "180" else 2.0
+    # candidates: side by side (2*eye), top/bottom (eye/2), mono (eye)
+    return min((("sbs", 2 * eye), ("tab", eye / 2), ("mono", eye)), key=lambda c: abs(c[1] - r))[0]
+
+
+def layout_from_name(name):
+    n = name.upper()
+    for keys, lay in ((("HSBS", "H-SBS", "HALF-SBS", "HALF.SBS", "HALFSBS", "HALF SBS"), "hsbs"),
+                      (("HOU", "H-OU", "HTAB", "H-TAB", "HALF-OU", "HALF.OU"), "htab"),
+                      (("FSBS", "FULL-SBS", "FULL.SBS", "FULLSBS"), "sbs"),
+                      (("FOU", "FULL-OU", "FTAB", "FULL.OU"), "tab")):
+        if any(k in n for k in keys):
+            return lay
+    return None  # plain "SBS" / "3D": decided by the frame size
+
+
+def layout_from_size(w, h):
+    if w <= 0 or h <= 0:
+        return None
+    if w * 10 >= h * 30:   # 32:9 or wider -> full SBS
+        return "sbs"
+    if w * 10 <= h * 12:   # almost square or taller -> full top/bottom
+        return "tab"
+    return "hsbs"          # 16:9 -> half SBS
+
+
+def subtitle_graph(sub, layout):
+    # ffmpeg filter path escaping (':' '\' and quotes are special inside filter args)
+    esc = sub.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    s = "subtitles='%s'" % esc
+    if layout in ("sbs", "hsbs"):
+        return "split[a][b];[a]crop=iw/2:ih:0:0,%s[l];[b]crop=iw/2:ih:iw/2:0,%s[r];[l][r]hstack" % (s, s)
+    if layout in ("tab", "htab"):
+        return "split[a][b];[a]crop=iw:ih/2:0:0,%s[t];[b]crop=iw:ih/2:0:ih/2,%s[d];[t][d]vstack" % (s, s)
+    return s
+
+
+# ---------------------------------------------------------------------------------------------
+# online videos (yt-dlp)
+# ---------------------------------------------------------------------------------------------
+def ytdlp_path():
+    exe = "yt-dlp.exe" if WINDOWS else "yt-dlp"
+    # ~/.local/bin first: the distribution's yt-dlp is usually too old for YouTube
+    return find_tool_first([os.path.expanduser("~/.local/bin/" + exe)]) or shutil.which(exe)
+
+
+def find_tool_first(paths):
+    for p in paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def ytdl_format(quality):
+    q = int(quality) if str(quality).isdigit() else 4320
+    return "bestvideo[height<=%d]+bestaudio/best[height<=%d]/best" % (q, q)
+
+
+def online_info(url, fmt):
+    """yt-dlp metadata of the format that will be played: (title, w, h, text to look for 3D/VR words in,
+    projection/stereo from the stream's own metadata)"""
+    yt = ytdlp_path()
+    if not yt:
+        raise SystemExit("Falta yt-dlp. Instala uno reciente (el de la distribucion suele estar viejo):\n"
+                         "  mkdir -p ~/.local/bin && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/"
+                         "download/yt-dlp -o ~/.local/bin/yt-dlp && chmod +x ~/.local/bin/yt-dlp")
+    try:
+        r = subprocess.run([yt, "-J", "--no-playlist", "--no-warnings", "-f", fmt, url],
+                           capture_output=True, text=True, timeout=90)
+        info = json.loads(r.stdout)
+        if not isinstance(info, dict):
+            raise ValueError("no info")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        err = (locals().get("r") and r.stderr.strip().splitlines() or ["?"])[-1]
+        raise SystemExit("yt-dlp no pudo leer el enlace: %s\n(si es YouTube, actualiza yt-dlp: yt-dlp -U)" % err)
+    vf = None
+    for f in info.get("requested_formats") or [info]:
+        if f.get("vcodec") not in (None, "none"):
+            vf = f
+            break
+    vf = vf or info
+    w, h = int(vf.get("width") or info.get("width") or 0), int(vf.get("height") or info.get("height") or 0)
+    words = " ".join([info.get("title") or "", " ".join(info.get("tags") or []),
+                      " ".join(info.get("categories") or []), vf.get("format_note") or "", vf.get("format") or ""])
+    # the stream itself may say it is spherical / stereo (YouTube adds it to 360 and 3D videos)
+    mproj = mstereo = None
+    if vf.get("url") and shutil.which("ffprobe"):
+        hdr = "".join("%s: %s\r\n" % kv for kv in (vf.get("http_headers") or {}).items())
+        pw, ph, mproj, mstereo = probe(vf["url"], extra=["-headers", hdr] if hdr else [], timeout=25)
+        if not (w and h):
+            w, h = pw, ph
+    return info.get("title") or url, w, h, words, mproj, mstereo
+
+
+def online_3d_words(text):
+    """3D layout named in a title / tags: 'sbs', 'tab', '3d' (3D, layout unknown) or None"""
+    toks = set(t for t in re.split(r"[^A-Z0-9]+", text.upper()) if t)
+    t = text.upper()
+    if toks & {"SBS", "HSBS", "LR", "3DH"} or "SIDE BY SIDE" in t or "SIDE-BY-SIDE" in t:
+        return "sbs"
+    if toks & {"OU", "TB", "TAB", "3DV", "HOU"} or "OVER UNDER" in t or "TOP BOTTOM" in t or "TOP-BOTTOM" in t:
+        return "tab"
+    if toks & {"3D", "YT3D", "STEREO", "STEREOSCOPIC"}:
+        return "3d"
+    return None
+
+
+def detect(path, isurl, layout, proj, quality):
+    """-> dict(title, width, height, layout, projection, note)"""
+    w = h = 0
+    mproj = mstereo = None
+    title = os.path.basename(path.rstrip("/\\")) if not isurl else path
+    words = title
+    if isurl:
+        title, w, h, words, mproj, mstereo = online_info(path, ytdl_format(quality))
+    else:
+        w, h, mproj, mstereo = probe(path)
+    note = ""
+    if proj == "auto":
+        nproj, nstereo = vr_from_name(words)
+        proj = mproj or nproj or "flat"
+        if proj != "flat" and layout == "auto":
+            layout = mstereo or nstereo or vr_layout_from_size(proj, w, h)
+    elif proj in ("180", "360") and layout == "auto":
+        nproj, nstereo = vr_from_name(words)
+        layout = mstereo or nstereo or vr_layout_from_size(proj, w, h)
+    if proj not in ("flat", "180", "360") and not proj.startswith("fisheye"):
+        raise SystemExit("--projection: flat, 180, 360 o fisheye[:GRADOS]")
+    if layout == "auto" and mstereo:
+        layout = {"sbs": "sbs" if w * 10 >= h * 30 else "hsbs", "tab": "tab" if w * 10 <= h * 12 else "htab"}.get(mstereo, "mono")
+    if layout == "auto" and isurl:
+        # online: only 3D when the video says so (stream metadata, title or tags); else a 2D video
+        k = online_3d_words(words)
+        if k == "tab":
+            layout = "tab" if w * 10 <= h * 12 else "htab"
+        elif k in ("sbs", "3d") or (h > 0 and w * 10 >= h * 30):
+            layout = layout_from_size(w, h) or "hsbs"
+            if layout == "tab":
+                layout = "htab"
+        else:
+            layout = "mono"
+            note = "sin indicios de 3D: se ve en 2D (usa --half / --tab si es 3D)"
+    if layout == "auto":
+        layout = layout_from_name(title) or layout_from_size(w, h)
+    if layout is None:
+        raise SystemExit("No puedo saber el formato (falta ffprobe: sudo apt install ffmpeg). "
+                         "Usa --full / --half / --tab / --htab / --2d")
+    return {"title": title, "width": w, "height": h, "layout": layout, "projection": proj, "note": note}
+
+
+# ---------------------------------------------------------------------------------------------
+# DeoVR (deovr.com and every site with the DeoVR JSON API: https://deovr.com/doc)
+#   list:  {"scenes": [{"name": ..., "list": [{"title", "videoLength", "thumbnailUrl", "video_url"}]}],
+#           "authorized": 1 | 0 | -1}
+#   video: {"title", "id", "is3d", "screenType": flat|dome|sphere|fisheye|mkx200|rf52,
+#           "stereoMode": sbs|tb|off|cuv, "encodings": [{"name", "videoSources": [{"resolution", "url"}]}]}
+#   login: the same URLs requested with POST fields "login" and "password"
+# ---------------------------------------------------------------------------------------------
+DEOVR_UA = "Mozilla/5.0 (X11; Linux x86_64) DeoVR/1.0 vrvideoplayer"
+KEYRING_SERVICE = "vrvideoplayer-deovr"
+
+
+def keyring_get(user):
+    """password saved in the desktop keyring (Secret Service) by the window"""
+    try:
+        import keyring  # python3-keyring
+        return keyring.get_password(KEYRING_SERVICE, user)
+    except Exception:
+        pass
+    if shutil.which("secret-tool"):
+        try:
+            r = subprocess.run(["secret-tool", "lookup", "service", KEYRING_SERVICE, "user", user],
+                               capture_output=True, text=True, timeout=15)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def deovr_credentials(login=None):
+    login = login or os.environ.get("VR_DEOVR_LOGIN")
+    if not login:
+        return None
+    pw = os.environ.get("VR_DEOVR_PASSWORD") or keyring_get(login)
+    if pw is None and sys.stdin.isatty():
+        import getpass
+        pw = getpass.getpass("Contrasena de DeoVR para %s: " % login)
+    return (login, pw or "")
+
+
+def is_deovr(path):
+    if path.startswith("deovr://"):
+        return True
+    if path.lower().endswith(".json") and os.path.isfile(path):
+        return True
+    u = urllib.parse.urlparse(path)
+    if u.scheme not in ("http", "https"):
+        return False
+    host = (u.hostname or "").lower()
+    return host == "deovr.com" or host.endswith(".deovr.com") or u.path.rstrip("/").endswith("/deovr") \
+        or "/deovr/" in u.path
+
+
+def deovr_fetch(url, cred):
+    """JSON object, or the page text when the site answers HTML"""
+    if os.path.isfile(url):
+        with open(url, encoding="utf-8") as f:
+            return json.load(f)
+    data = urllib.parse.urlencode({"login": cred[0], "password": cred[1]}).encode() if cred else None
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": DEOVR_UA,
+                                                          "Accept": "application/json, text/html;q=0.8, */*;q=0.5"})
+    try:
+        with urllib.request.urlopen(req, timeout=40) as r:
+            body = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise SystemExit("DeoVR: acceso denegado (%d). Inicia sesion o comprueba el usuario y la contrasena" % e.code)
+        raise SystemExit("DeoVR: error %d en %s" % (e.code, url))
+    except (urllib.error.URLError, OSError) as e:
+        raise SystemExit("DeoVR: no se pudo conectar con %s (%s)" % (url, getattr(e, "reason", e)))
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return body
+    if isinstance(obj, dict) and obj.get("authorized") in (-1, "-1"):
+        raise SystemExit("DeoVR: usuario o contrasena incorrectos")
+    return obj
+
+
+def deovr_list_url(url):
+    """bare site address -> its /deovr list"""
+    u = urllib.parse.urlparse(url)
+    if u.path in ("", "/"):
+        return urllib.parse.urlunparse(u._replace(path="/deovr"))
+    return url
+
+
+def deovr_items(obj):
+    for sc in obj.get("scenes") or []:
+        for it in sc.get("list") or []:
+            yield sc.get("name") or "", it
+
+
+def deovr_find_in_page(page, url):
+    """the DeoVR JSON of a video from its web page: deovr:// deeplink, /deovr/video/id/N, video_url..."""
+    pats = [r'deovr://(https?://[^"\'<>\s]+)', r'(https?://[^"\'<>\s]*/deovr/video/id/\d+)',
+            r'["\'](/deovr/video/id/\d+)', r'"video_url"\s*:\s*"([^"]+)"', r'(https?://[^"\'<>\s]+\.json)']
+    for p in pats:
+        m = re.search(p, page)
+        if m:
+            return urllib.parse.urljoin(url, m.group(1).replace("\\/", "/"))
+    # deovr.com pages usually end with the video's number
+    u = urllib.parse.urlparse(url)
+    m = re.search(r"(\d{2,})(?:\D*)$", u.path)
+    if m and (u.hostname or "").endswith("deovr.com"):
+        return "%s://%s/deovr/video/id/%s" % (u.scheme, u.hostname, m.group(1))
+    return None
+
+
+def deovr_resolve(path, quality, cred):
+    """-> dict(title, url, layout, projection, width, height) of the video a DeoVR link points to"""
+    url = path[len("deovr://"):] if path.startswith("deovr://") else path
+    obj = deovr_fetch(deovr_list_url(url), cred)
+    for _ in range(3):
+        if isinstance(obj, str):
+            nxt = deovr_find_in_page(obj, url)
+            if not nxt:
+                raise SystemExit("DeoVR: no encuentro el video en esa pagina. Usa la ventana DeoVR (lista de videos) "
+                                 "o el enlace del JSON (/deovr/video/id/N)")
+            url, obj = nxt, deovr_fetch(nxt, cred)
+            continue
+        if isinstance(obj, dict) and "encodings" not in obj and "videoSources" not in obj and obj.get("scenes"):
+            items = [it for _, it in deovr_items(obj)]
+            if len(items) != 1:
+                raise SystemExit("DeoVR: es una lista de %d videos; elige uno en la ventana DeoVR "
+                                 "(vr-play --deovr-list %s)" % (len(items), url))
+            it = items[0]
+            if it.get("encodings"):
+                obj = it
+                break
+            url, obj = urllib.parse.urljoin(url, it["video_url"]), deovr_fetch(urllib.parse.urljoin(url, it["video_url"]), cred)
+            continue
+        break
+    if not isinstance(obj, dict) or ("encodings" not in obj and "videoSources" not in obj):
+        raise SystemExit("DeoVR: la respuesta no describe ningun video")
+    srcs = []
+    for enc in obj.get("encodings") or [{"name": "", "videoSources": obj.get("videoSources") or []}]:
+        for sv in enc.get("videoSources") or []:
+            if sv.get("url"):
+                try:
+                    res = int(sv.get("resolution") or 0)
+                except (TypeError, ValueError):
+                    res = 0
+                hevc = 1 if re.search(r"265|hevc", str(enc.get("name", "")), re.I) else 0
+                srcs.append((res, hevc, urllib.parse.urljoin(url, sv["url"])))
+    if not srcs:
+        raise SystemExit("DeoVR: el video no tiene fuentes accesibles (si es premium, inicia sesion)")
+    q = int(quality) if str(quality).isdigit() else 4320
+    under = [x for x in srcs if x[0] <= q]
+    pick = max(under) if under else min(srcs)
+    # projection and 3D layout: the JSON fields (several spellings), then the names (title, file of the
+    # source: ..._180_LR.mp4), then the stream's own metadata / frame shape. DeoVR's default is 3D.
+    def field(*names):
+        for n in names:
+            for k, v in obj.items():
+                if k.lower() == n.lower() and v not in (None, ""):
+                    return str(v).strip().lower()
+        return None
+    why = []
+    st = field("screenType", "screen_type", "projection", "videoType")
+    proj = {"flat": "flat", "2d": "flat", "dome": "180", "180": "180", "equirect180": "180", "vr180": "180",
+            "sphere": "360", "360": "360", "equirect360": "360", "vr360": "360", "fisheye": "fisheye:180",
+            "fisheye180": "fisheye:180", "mkx200": "fisheye:200", "mkx220": "fisheye:220", "vrca220": "fisheye:220",
+            "rf52": "fisheye:190", "fisheye190": "fisheye:190"}.get(st or "", None)
+    if proj:
+        why.append("screenType=" + st)
+    sm = field("stereoMode", "stereo_mode", "stereo", "layout", "3dMode")
+    layout = {"sbs": "sbs", "lr": "sbs", "rl": "sbs", "side_by_side": "sbs", "sidebyside": "sbs", "3dh": "sbs",
+              "cuv": "sbs", "tb": "tab", "ou": "tab", "bt": "tab", "top_bottom": "tab", "topbottom": "tab",
+              "over_under": "tab", "3dv": "tab", "off": "mono", "mono": "mono", "none": "mono", "2d": "mono",
+              "flat": "mono"}.get(sm or "", None)
+    if layout:
+        why.append("stereoMode=" + sm)
+    names = " ".join([str(obj.get("title") or ""), urllib.parse.unquote(urllib.parse.urlparse(pick[2]).path)])
+    nproj, nstereo = vr_from_name(names)
+    if not proj and nproj:
+        proj = nproj
+        why.append("nombre: " + nproj)
+    if not layout and nstereo:
+        layout = nstereo
+        why.append("nombre: " + nstereo)
+    if not proj or not layout:
+        hdr = "User-Agent: %s\r\n" % DEOVR_UA
+        w, h, mproj, mstereo = probe(pick[2], extra=["-headers", hdr], timeout=25)
+        if not proj and mproj:
+            proj = mproj
+            why.append("metadatos: " + mproj)
+        if not layout and mstereo:
+            layout = mstereo
+            why.append("metadatos: " + mstereo)
+        if not proj:  # DeoVR is mostly 180 VR; a 16:9 or 32:9 frame is a flat video
+            proj = "flat" if (w and h and abs(w / float(h) - 16 / 9.0) < 0.05) or (h and w * 10 >= h * 30 and
+                                                                                  w / float(h) < 3.7) else "180"
+            why.append("supuesto: " + proj)
+        if not layout:
+            if obj.get("is3d") in (False, 0, "false", "0"):
+                layout = "mono"
+                why.append("is3d=false")
+            elif proj == "flat":
+                layout = "sbs" if (w and h and w * 10 >= h * 30) else "hsbs"
+                why.append("supuesto: 3D " + layout)
+            else:
+                layout = vr_layout_from_size(proj.split(":")[0] if not proj.startswith("fisheye") else "180", w, h)
+                why.append("forma %dx%d: %s" % (w, h, layout))
+    log("DeoVR formato: %s, %s (%s)" % (proj, layout, "; ".join(why)))
+    res = pick[0]
+    return {"title": obj.get("title") or os.path.basename(urllib.parse.urlparse(url).path), "url": pick[2],
+            "layout": layout, "projection": proj, "width": 0, "height": res, "note": "",
+            "sources": sorted(set(x[0] for x in srcs)), "resolution": res}
+
+
+def deovr_list(url, cred):
+    """catalogue for the window: {"authorized", "scenes": [{"name", "list": [{"title", "length", "url"}]}]}"""
+    base = deovr_list_url(url)
+    obj = deovr_fetch(base, cred)
+    if isinstance(obj, str):
+        raise SystemExit("DeoVR: %s no devuelve una lista DeoVR" % base)
+    out = {"authorized": obj.get("authorized", 0), "scenes": []}
+    tmpdir = None
+    for sc in obj.get("scenes") or []:
+        lst = []
+        for it in sc.get("list") or []:
+            vu = it.get("video_url")
+            if not vu and it.get("encodings"):  # full description embedded in the list
+                tmpdir = tmpdir or tempfile.mkdtemp(prefix="vrdeovr.")
+                vu = os.path.join(tmpdir, "%d.json" % len(lst))
+                with open(vu, "w", encoding="utf-8") as f:
+                    json.dump(it, f)
+            if vu:
+                vu = vu if os.path.isabs(vu) else urllib.parse.urljoin(base, vu)
+                lst.append({"title": it.get("title") or "?", "length": it.get("videoLength") or 0, "url": vu})
+        out["scenes"].append({"name": sc.get("name") or "", "list": lst})
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    layout, swap, sub, subtrack, runtime, path = "auto", False, None, None, None, None
+    proj, quality, probe_only = "auto", "4320", False
+    force_deovr, deovr_login, deovr_list_mode, deovr_dump = False, None, False, False
+    vr, extra = [], []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if a in ("--full", "--sbs"):
+            layout = "sbs"
+        elif a in ("--half", "--hsbs"):
+            layout = "hsbs"
+        elif a in ("--tab", "--ou"):
+            layout = "tab"
+        elif a in ("--htab", "--hou"):
+            layout = "htab"
+        elif a in ("--2d", "--mono"):
+            layout = "mono"
+        elif a in ("--180", "--vr180"):
+            proj = "180"
+        elif a in ("--360", "--vr360"):
+            proj = "360"
+        elif a == "--fisheye":
+            proj = "fisheye"
+        elif a == "--flat":
+            proj = "flat"
+        elif a.startswith("--projection="):
+            proj = a.split("=", 1)[1]
+        elif a == "--quality":
+            quality = nxt; i += 1
+        elif a.startswith("--quality="):
+            quality = a.split("=", 1)[1]
+        elif a == "--probe":
+            probe_only = True
+        elif a == "--deovr":
+            force_deovr = True
+        elif a == "--deovr-dump":
+            deovr_dump = True
+        elif a == "--deovr-login":
+            deovr_login = nxt; i += 1
+        elif a == "--deovr-list":
+            deovr_list_mode = True
+            if nxt and not nxt.startswith("--"):
+                path = nxt; i += 1
+        elif a == "--swap":
+            swap = True
+        elif a == "--sub":
+            sub = nxt; i += 1
+        elif a == "--sub-track":
+            subtrack = nxt; i += 1
+        elif a == "--runtime":
+            runtime = nxt; i += 1
+        elif a.startswith("--runtime="):
+            runtime = a.split("=", 1)[1]
+        elif a == "--screen":
+            vr.append("--vr-screen=" + nxt); i += 1
+        elif a == "--distance":
+            vr.append("--vr-distance=" + nxt); i += 1
+        elif a == "--mode":
+            vr.append("--vr-mode=" + nxt); i += 1
+        elif a in ("-h", "--help"):
+            src = open(os.path.realpath(__file__)).read().split("\n# Copyright")[0].split("\n")[1:]
+            print("\n".join(l[2:] for l in src))
+            return 0
+        elif a.startswith("--vr-"):
+            vr.append(a)
+        elif a.startswith("--"):
+            extra.append(a)
+        else:
+            path = a
+        i += 1
+    cred = deovr_credentials(deovr_login)
+    if deovr_dump:  # what the site answers, to see why a video is detected one way or another
+        u = path[len("deovr://"):] if path.startswith("deovr://") else path
+        obj = deovr_fetch(deovr_list_url(u), cred)
+        txt = json.dumps(obj, indent=1, ensure_ascii=False) if not isinstance(obj, str) else obj[:4000]
+        print(re.sub(r'("(?:url|password)"\s*:\s*")[^"]*\?[^"]*"', r'\1(enlace con token oculto)"', txt))
+        return 0
+    if deovr_list_mode:
+        print(json.dumps(deovr_list(path or "https://deovr.com/deovr", cred), ensure_ascii=False))
+        return 0
+    if not path:
+        raise SystemExit("uso: vr-play [opciones] ARCHIVO|CARPETA|DISCO.iso|URL   (vr-play --help)")
+
+    isurl = re.match(r"^[a-z]+://", path) is not None
+    dv = None
+    if force_deovr or is_deovr(path):
+        dv = deovr_resolve(path, quality, cred)
+        if layout != "auto":
+            dv["layout"] = layout
+        if proj != "auto":
+            dv["projection"] = proj
+    if probe_only:  # for the window: what would be played, without playing it
+        if dv:
+            out = dict(dv)
+            out.pop("url", None)
+        elif not isurl and is_bluray(path):
+            out = {"title": os.path.basename(os.path.normpath(path)), "layout": "sbs", "projection": "flat",
+                   "bluray": True, "width": 3840, "height": 1080, "note": ""}
+        else:
+            target = folder_videos(path)[0] if (not isurl and os.path.isdir(path) and folder_videos(path)) else path
+            out = detect(target, isurl, layout, proj, quality)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    env = dict(os.environ)
+    rj = resolve_runtime(runtime)
+    if rj:
+        env["XR_RUNTIME_JSON"] = rj
+        log("runtime OpenXR: " + rj)
+    elif not env.get("XR_RUNTIME_JSON"):
+        act = active_runtime_name()
+        if act:
+            log("runtime OpenXR activo: " + act)
+
+    # Blu-ray 3D: folder with BDMV or ISO -> vr-bd (own MVC decoder)
+    if not isurl and is_bluray(path):
+        bd = vrbd_path()
+        if not bd:
+            raise SystemExit("Falta vr-bd (ejecuta ./install.sh)")
+        cmd = [sys.executable, bd] if bd.endswith(".py") or WINDOWS else [bd]
+        if swap:
+            cmd.append("--swap")
+        cmd += vr + extra + [path]
+        return subprocess.call(cmd, env=env)
+
+    exe = vrvideo_path()
+    if not exe:
+        raise SystemExit("Falta vrvideo (ejecuta ./install.sh)")
+
+    files = [path]
+    if dv:
+        files, isurl = [dv["url"]], True
+        extra = ["--force-media-title=" + dv["title"]] + extra
+    elif not isurl and os.path.isdir(path):
+        files = folder_videos(path)
+        if not files:
+            raise SystemExit("No hay videos en la carpeta: " + path)
+        log("%d videos en la carpeta" % len(files))
+    elif not isurl and not os.path.isfile(path):
+        raise SystemExit("No existe: " + path)
+
+    if dv:
+        d = dv
+        log("DeoVR: %s (%dp de %s)" % (dv["title"], dv["resolution"], "/".join("%dp" % r for r in dv["sources"])))
+    else:
+        if isurl:
+            log("consultando el video online...")
+            fmt = ytdl_format(quality)
+            extra = ["--ytdl-format=" + fmt, "--script-opts-append=ytdl_hook-ytdl_path=" + (ytdlp_path() or "yt-dlp")] + extra
+        d = detect(files[0], isurl, layout, proj, quality)
+    layout, proj = d["layout"], d["projection"]
+    if isurl:
+        log(d["title"])
+    if d["note"]:
+        log(d["note"])
+    log("%s%s" % (layout, "" if proj == "flat" else ", VR " + proj))
+    if proj != "flat":
+        vr.append("--vr-projection=" + proj)
+
+    # subtitles: burnt into each eye (mpv would draw them over the double image)
+    tmpdir = None
+    vf = []
+    if subtrack is not None and not isurl:
+        if not shutil.which("ffmpeg"):
+            raise SystemExit("Falta ffmpeg para extraer subtitulos")
+        tmpdir = tempfile.mkdtemp(prefix="vrplay.")
+        sub = os.path.join(tmpdir, "sub.ass")
+        log("extrayendo subtitulos (pista %s)..." % subtrack)
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", files[0], "-map", "0:s:%s" % subtrack, sub])
+        if r.returncode != 0:
+            raise SystemExit("No se pudo extraer (solo subtitulos de texto: srt/ass)")
+    if sub:
+        if not os.path.isfile(sub):
+            raise SystemExit("No existe: " + sub)
+        if tmpdir is None:
+            tmpdir = tempfile.mkdtemp(prefix="vrplay.")
+        safe = os.path.join(tmpdir, "s" + os.path.splitext(sub)[1].lower())
+        if os.path.abspath(sub) != safe:
+            shutil.copyfile(sub, safe)
+        g = subtitle_graph(safe, layout)
+        vf = ["--vf=lavfi=graph=%%%d%%%s" % (len(g.encode()), g), "--hwdec=auto-copy-safe", "--sid=no"]
+
+    cmd = [exe, "--vr-layout=" + layout] + (["--vr-swap"] if swap else []) + vr + vf + extra + files
+    try:
+        return subprocess.call(cmd, env=env)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

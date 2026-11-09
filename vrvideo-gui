@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+# vrvideo-gui - choose a 3D video, a folder or a 3D Blu-ray and play it in the VR headset (vr-play).
+# Tkinter only (comes with Python, also on Windows).
+#
+# Copyright (C) 2026 Artur Viader Mataix. GPLv3.
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+WINDOWS = os.name == "nt"
+VIDEO_EXT = (".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".webm", ".mpg", ".mpeg",
+             ".flv", ".3gp", ".ogv", ".vob")
+
+
+def _lang_es():
+    for v in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        l = os.environ.get(v)
+        if l:
+            return l[:2] in ("es", "ca")
+    if WINDOWS:
+        try:
+            import locale
+            return (locale.getdefaultlocale()[0] or "")[:2] in ("es", "ca")
+        except Exception:
+            pass
+    return False
+
+
+ES = _lang_es()
+
+
+def T(es, en):
+    return es if ES else en
+
+
+FORMATS = [("auto", T("Automático", "Automatic")), ("sbs", T("SBS completo (lado a lado, LR)", "Full SBS (side by side, LR)")),
+           ("hsbs", "Half SBS"), ("tab", T("Arriba/abajo completo (TB)", "Full top/bottom (TB)")),
+           ("htab", T("Half arriba/abajo", "Half top/bottom")), ("mono", T("2D (vídeo normal)", "2D (flat video)"))]
+PROJECTIONS = [("auto", T("Automática", "Automatic")), ("flat", T("Pantalla de cine (película)", "Cinema screen (movie)")),
+               ("180", T("Vídeo VR 180°", "VR video 180°")), ("360", T("Vídeo VR 360°", "VR video 360°")),
+               ("fisheye", T("Vídeo VR ojo de pez", "VR video fisheye"))]
+QUALITIES = [("4320", T("Máxima (hasta 8K)", "Best (up to 8K)")), ("2160", "4K (2160p)"), ("1440", "1440p"),
+             ("1080", "1080p")]
+FORMAT_NAMES = {"sbs": T("SBS completo", "Full SBS"), "hsbs": "Half SBS", "tab": T("arriba/abajo completo", "full top/bottom"),
+                "htab": T("half arriba/abajo", "half top/bottom"), "mono": "2D"}
+RUNTIMES = [("auto", T("El activo del sistema", "System default")), ("wivrn", "WiVRn"), ("steamvr", "SteamVR")]
+MODES = [("quad", T("Capas por ojo (recomendado)", "Per-eye layers (recommended)")),
+         ("render", T("Dibujado propio (alternativo)", "Own rendering (fallback)"))]
+
+
+def config_dir():
+    if WINDOWS:
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "vrvideoplayer")
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "vrvideoplayer")
+
+
+def is_bluray(path):
+    if path.lower().endswith(".iso") and os.path.isfile(path):
+        return True
+    if os.path.isdir(path):
+        if os.path.basename(os.path.normpath(path)).upper() == "BDMV":
+            return os.path.isdir(os.path.join(path, "PLAYLIST"))
+        return any(os.path.isdir(os.path.join(path, b, p)) for b in ("BDMV", "bdmv") for p in ("PLAYLIST", "playlist"))
+    return False
+
+
+KEYRING_SERVICE = "vrvideoplayer-deovr"
+
+
+def keyring_get(user):
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, user)
+    except Exception:
+        pass
+    if shutil.which("secret-tool"):
+        try:
+            r = subprocess.run(["secret-tool", "lookup", "service", KEYRING_SERVICE, "user", user],
+                               capture_output=True, text=True, timeout=15)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def keyring_set(user, pw):
+    """saves the password in the desktop keyring (never in a plain file); False if there is no keyring"""
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE, user, pw)
+        return True
+    except Exception:
+        pass
+    if shutil.which("secret-tool"):
+        try:
+            r = subprocess.run(["secret-tool", "store", "--label=VR Video Player (DeoVR)", "service", KEYRING_SERVICE,
+                                "user", user], input=pw, text=True, capture_output=True, timeout=20)
+            return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False
+
+
+def keyring_delete(user):
+    try:
+        import keyring
+        keyring.delete_password(KEYRING_SERVICE, user)
+    except Exception:
+        pass
+    if shutil.which("secret-tool"):
+        subprocess.run(["secret-tool", "clear", "service", KEYRING_SERVICE, "user", user], capture_output=True)
+
+
+def norm(t):
+    """lower case without accents, for searching ("Islandia" finds "islándia")"""
+    t = unicodedata.normalize("NFKD", t.lower())
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def url_host(u):
+    m = re.match(r"^[a-z]+://([^/:?#]+)", u.strip().replace("deovr://", "", 1), re.I)
+    return m.group(1).lower() if m else ""
+
+
+def vrplay_cmd():
+    p = shutil.which("vr-play") or os.path.join(HERE, "vr-play")
+    return [sys.executable, p]
+
+
+def fmt_size(n):
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return ("%.1f %s" % (n, u)) if u != "B" else "%d B" % n
+        n /= 1024.0
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.proc = None
+        self.q = queue.Queue()
+        self.items = []  # paths shown in the list
+        self.cfg = self.load_cfg()
+        root.title("VR Video Player")
+        root.geometry(self.cfg.get("geometry", "900x760"))
+        root.minsize(640, 480)
+        try:
+            ttk.Style().theme_use("clam")
+        except tk.TclError:
+            pass
+        self.build()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.after(100, self.poll)
+        self.deovr = {"login": self.cfg.get("deovr_login", ""), "password": "", "ok": False}
+        if self.deovr["login"] and self.cfg.get("deovr_remember"):
+            self.deovr["password"] = keyring_get(self.deovr["login"]) or ""
+        self.deovr_win = None
+        last = self.cfg.get("last_folder")
+        if last and os.path.isdir(last):
+            self.show_folder(last, select=False)
+
+    # ---- settings ------------------------------------------------------------------------------
+    def load_cfg(self):
+        try:
+            with open(os.path.join(config_dir(), "gui.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_cfg(self):
+        c = self.cfg
+        c.update({"quality": self.quality_key(), "projection": self.proj_key(), "format": self.fmt_key(), "swap": self.swap.get(), "runtime": self.rt_key(), "mode": self.mode_key(),
+                  "screen": self.screen.get().strip(), "distance": self.dist.get().strip(),
+                  "alang": self.alang.get().strip(), "geometry": self.root.geometry()})
+        try:
+            os.makedirs(config_dir(), exist_ok=True)
+            with open(os.path.join(config_dir(), "gui.json"), "w") as f:
+                json.dump(c, f, indent=1)
+        except OSError:
+            pass
+
+    # ---- layout --------------------------------------------------------------------------------
+    def build(self):
+        pad = {"padx": 6, "pady": 4}
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text=T("Vídeo, carpeta, ISO o URL:", "Video, folder, ISO or URL:")).pack(anchor="w")
+        row = ttk.Frame(top)
+        row.pack(fill="x")
+        self.path = ttk.Combobox(row, values=self.cfg.get("recent", []))
+        self.path.pack(side="left", fill="x", expand=True)
+        self.path.bind("<Return>", lambda e: self.play())
+        self.path.bind("<<Paste>>", lambda e: self.root.after(50, self.path_changed))
+        self.path.bind("<FocusOut>", lambda e: self.path_changed(only_url=True))
+        self.path.bind("<<ComboboxSelected>>", lambda e: self.path_changed())
+        ttk.Button(row, text=T("Archivo…", "File…"), command=self.pick_file).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text=T("Carpeta…", "Folder…"), command=self.pick_folder).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text=T("Enlace web…", "Web link…"), command=self.pick_url).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="DeoVR…", command=self.open_deovr).pack(side="left", padx=(6, 0))
+        self.kind = ttk.Label(top, text="", foreground="#2a6")
+        self.kind.pack(anchor="w")
+
+        # log at the bottom (packed before the middle so it keeps its height)
+        bottom = ttk.Frame(self.root)
+        bottom.pack(side="bottom", fill="x", **pad)
+        self.status = ttk.Label(bottom, text=T("Listo", "Ready"))
+        self.status.pack(anchor="w")
+        self.log = tk.Text(bottom, height=8, wrap="word", state="disabled", background="#111", foreground="#ddd",
+                           font=("monospace", 9))
+        self.log.pack(fill="x")
+
+        mid = ttk.PanedWindow(self.root, orient="horizontal")
+        mid.pack(fill="both", expand=True, **pad)
+
+        # folder contents
+        left = ttk.Frame(mid)
+        self.folder_lbl = ttk.Label(left, text=T("Contenido de la carpeta", "Folder contents"))
+        self.folder_lbl.pack(anchor="w")
+        lf = ttk.Frame(left)
+        lf.pack(fill="both", expand=True)
+        self.lst = tk.Listbox(lf, activestyle="dotbox", exportselection=False)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.lst.yview)
+        self.lst.configure(yscrollcommand=sb.set)
+        self.lst.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.lst.bind("<<ListboxSelect>>", self.list_select)
+        self.lst.bind("<Double-Button-1>", lambda e: self.play())
+        self.lst.bind("<Return>", lambda e: self.play())
+        nav = ttk.Frame(left)
+        nav.pack(fill="x")
+        ttk.Button(nav, text=T("⬆ Subir", "⬆ Up"), command=self.folder_up).pack(side="left")
+        ttk.Button(nav, text=T("Reproducir carpeta entera", "Play whole folder"),
+                   command=self.play_folder).pack(side="left", padx=6)
+        mid.add(left, weight=3)
+
+        # options
+        opt = ttk.LabelFrame(mid, text=T("Opciones", "Options"))
+        mid.add(opt, weight=2)
+        g = {"sticky": "we", "padx": 6, "pady": 3}
+        r = 0
+
+        def lab(text):
+            nonlocal r
+            ttk.Label(opt, text=text).grid(row=r, column=0, sticky="w", padx=6, pady=3)
+
+        lab(T("Proyección", "Projection"))
+        self.proj = ttk.Combobox(opt, state="readonly", values=[n for _, n in PROJECTIONS], width=26)
+        self.proj.current(self.index(PROJECTIONS, self.cfg.get("projection", "auto")))
+        self.proj.grid(row=r, column=1, **g); r += 1
+        lab(T("Formato 3D", "3D format"))
+        self.fmt = ttk.Combobox(opt, state="readonly", values=[n for _, n in FORMATS], width=26)
+        self.fmt.current(self.index(FORMATS, self.cfg.get("format", "auto")))
+        self.fmt.grid(row=r, column=1, **g); r += 1
+        self.swap = tk.BooleanVar(value=self.cfg.get("swap", False))
+        ttk.Checkbutton(opt, text=T("Invertir ojos", "Swap eyes"), variable=self.swap).grid(row=r, column=1, sticky="w", padx=6)
+        r += 1
+        lab(T("Calidad online", "Online quality"))
+        qf = ttk.Frame(opt)
+        qf.grid(row=r, column=1, **g); r += 1
+        self.quality = ttk.Combobox(qf, state="readonly", values=[n for _, n in QUALITIES], width=16)
+        self.quality.current(self.index(QUALITIES, self.cfg.get("quality", "4320")))
+        self.quality.pack(side="left", fill="x", expand=True)
+        ttk.Button(qf, text=T("Actualizar yt-dlp", "Update yt-dlp"), command=self.update_ytdlp).pack(side="left", padx=(4, 0))
+        lab(T("Runtime VR", "VR runtime"))
+        self.rt = ttk.Combobox(opt, state="readonly", values=[n for _, n in RUNTIMES], width=26)
+        self.rt.current(self.index(RUNTIMES, self.cfg.get("runtime", "auto")))
+        self.rt.grid(row=r, column=1, **g); r += 1
+        lab(T("Modo de imagen", "Image mode"))
+        self.mode = ttk.Combobox(opt, state="readonly", values=[n for _, n in MODES], width=26)
+        self.mode.current(self.index(MODES, self.cfg.get("mode", "quad")))
+        self.mode.grid(row=r, column=1, **g); r += 1
+        lab(T("Ancho pantalla (m)", "Screen width (m)"))
+        self.screen = ttk.Entry(opt, width=8)
+        self.screen.insert(0, self.cfg.get("screen", ""))
+        self.screen.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
+        lab(T("Distancia (m)", "Distance (m)"))
+        self.dist = ttk.Entry(opt, width=8)
+        self.dist.insert(0, self.cfg.get("distance", ""))
+        self.dist.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
+        ttk.Label(opt, text=T("(vacío = el último usado en el visor)", "(empty = last used in the headset)"),
+                  foreground="#777").grid(row=r, column=1, sticky="w", padx=6); r += 1
+        lab(T("Idioma audio", "Audio language"))
+        self.alang = ttk.Entry(opt, width=12)
+        self.alang.insert(0, self.cfg.get("alang", ""))
+        self.alang.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
+        ttk.Label(opt, text=T("spa, eng... (vacío = el del sistema)", "spa, eng... (empty = system)"),
+                  foreground="#777").grid(row=r, column=1, sticky="w", padx=6); r += 1
+        lab(T("Empezar en", "Start at"))
+        self.start = ttk.Entry(opt, width=12)
+        self.start.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
+        lab(T("Subtítulos", "Subtitles"))
+        sf = ttk.Frame(opt)
+        sf.grid(row=r, column=1, **g); r += 1
+        self.sub = ttk.Entry(sf)
+        self.sub.pack(side="left", fill="x", expand=True)
+        ttk.Button(sf, text="…", width=3, command=self.pick_sub).pack(side="left", padx=(4, 0))
+        opt.columnconfigure(1, weight=1)
+
+        bt = ttk.Frame(opt)
+        bt.grid(row=r, column=0, columnspan=2, sticky="we", padx=6, pady=(14, 6)); r += 1
+        self.play_btn = ttk.Button(bt, text=T("▶  Reproducir en el visor", "▶  Play in the headset"), command=self.play)
+        self.play_btn.pack(fill="x")
+        self.stop_btn = ttk.Button(bt, text=T("■  Detener", "■  Stop"), command=self.stop, state="disabled")
+        self.stop_btn.pack(fill="x", pady=(6, 0))
+        help_txt = T("En el visor: gatillo = pausa · stick = ±10 s / ±1 min · B/Y = audio\n"
+                     "A/X = info · agarre + stick = tamaño/distancia · clic stick = centrar\n"
+                     "menú mantenido = salir · VR 180/360: clic stick = el frente es hacia donde miras",
+                     "In the headset: trigger = pause · stick = ±10 s / ±1 min · B/Y = audio\n"
+                     "A/X = info · grip + stick = size/distance · stick click = recenter\n"
+                     "hold menu = quit · VR 180/360: stick click = this way is the front")
+        ttk.Label(opt, text=help_txt, foreground="#555", justify="left").grid(row=r, column=0, columnspan=2,
+                                                                             sticky="w", padx=6, pady=6)
+
+
+    @staticmethod
+    def index(options, key):
+        for i, (k, _) in enumerate(options):
+            if k == key:
+                return i
+        return 0
+
+    def fmt_key(self):
+        return FORMATS[max(0, self.fmt.current())][0]
+
+    def proj_key(self):
+        return PROJECTIONS[max(0, self.proj.current())][0]
+
+    def quality_key(self):
+        return QUALITIES[max(0, self.quality.current())][0]
+
+    def rt_key(self):
+        return RUNTIMES[max(0, self.rt.current())][0]
+
+    def mode_key(self):
+        return MODES[max(0, self.mode.current())][0]
+
+    # ---- choosing -------------------------------------------------------------------------------
+    def start_dir(self):
+        p = self.path.get().strip()
+        if p and os.path.isdir(p):
+            return p
+        if p and os.path.isfile(p):
+            return os.path.dirname(p)
+        return self.cfg.get("last_folder") or os.path.expanduser("~")
+
+    def pick_file(self):
+        f = filedialog.askopenfilename(
+            parent=self.root, initialdir=self.start_dir(), title=T("Elige un vídeo 3D o una ISO", "Choose a 3D video or an ISO"),
+            filetypes=[(T("Vídeos e ISOs", "Videos and ISOs"), " ".join("*" + e for e in VIDEO_EXT + (".iso",))),
+                       (T("Todos", "All"), "*")])
+        if f:
+            self.set_path(f)
+
+    def pick_folder(self):
+        d = filedialog.askdirectory(parent=self.root, initialdir=self.start_dir(),
+                                    title=T("Elige una carpeta (vídeos o Blu-ray)", "Choose a folder (videos or Blu-ray)"))
+        if d:
+            self.set_path(d)
+
+    def pick_sub(self):
+        f = filedialog.askopenfilename(parent=self.root, initialdir=self.start_dir(),
+                                       filetypes=[(T("Subtítulos", "Subtitles"), "*.srt *.ass *.ssa"), (T("Todos", "All"), "*")])
+        if f:
+            self.sub.delete(0, "end")
+            self.sub.insert(0, f)
+
+    def set_path(self, p):
+        self.path.set(p)
+        self.path_changed()
+
+    def path_changed(self, only_url=False):
+        p = self.path.get().strip()
+        if re.match(r"^[a-z]+://", p):
+            if p != getattr(self, "analyzed_url", None):
+                self.analyze_url(p)
+            return
+        if only_url:
+            return
+        if os.path.isdir(p):
+            if is_bluray(p):
+                self.kind.config(text=T("Blu-ray 3D (se reproduce el título principal en 3D)",
+                                        "3D Blu-ray (the main title plays in 3D)"))
+                parent = os.path.dirname(os.path.normpath(p))
+                if os.path.basename(os.path.normpath(p)).upper() == "BDMV":
+                    parent = os.path.dirname(parent)
+                self.show_folder(parent or p, select=False, highlight=os.path.normpath(p))
+            else:
+                self.show_folder(p)
+        elif os.path.isfile(p):
+            self.kind.config(text=self.describe(p))
+            self.show_folder(os.path.dirname(p), select=False, highlight=p)
+        else:
+            self.kind.config(text="")
+
+    # ---- online videos ---------------------------------------------------------------------------
+    def pick_url(self):
+        """small dialog for a YouTube (or any yt-dlp site) link; takes it from the clipboard if there is one"""
+        d = tk.Toplevel(self.root)
+        d.title(T("Abrir enlace web", "Open web link"))
+        d.transient(self.root)
+        d.resizable(True, False)
+        ttk.Label(d, text=T("Enlace de YouTube u otra web (vídeo 3D o VR 180/360):",
+                            "YouTube or other site link (3D or VR 180/360 video):")).pack(anchor="w", padx=10, pady=(10, 4))
+        e = ttk.Entry(d, width=70)
+        e.pack(fill="x", padx=10)
+        try:
+            clip = self.root.clipboard_get().strip()
+            if re.match(r"^https?://", clip):
+                e.insert(0, clip)
+        except tk.TclError:
+            pass
+        e.focus_set()
+        e.select_range(0, "end")
+        res = {}
+
+        def ok(play=False):
+            u = e.get().strip()
+            if not re.match(r"^[a-z]+://", u):
+                if u and "." in u and " " not in u:
+                    u = "https://" + u
+                else:
+                    messagebox.showerror("VR Video Player", T("No parece un enlace", "That is not a link"), parent=d)
+                    return
+            res["url"], res["play"] = u, play
+            d.destroy()
+
+        b = ttk.Frame(d)
+        b.pack(fill="x", padx=10, pady=10)
+        ttk.Button(b, text=T("▶ Reproducir", "▶ Play"), command=lambda: ok(True)).pack(side="right")
+        ttk.Button(b, text=T("Analizar", "Analyze"), command=ok).pack(side="right", padx=6)
+        ttk.Button(b, text=T("Cancelar", "Cancel"), command=d.destroy).pack(side="right")
+        e.bind("<Return>", lambda ev: ok(True))
+        d.bind("<Escape>", lambda ev: d.destroy())
+        d.wait_window()
+        if res.get("url"):
+            self.path.set(res["url"])
+            if res["play"]:
+                self.analyzed_url = res["url"]  # vr-play detects it again while starting
+                self.play()
+            else:
+                self.analyze_url(res["url"])
+
+    def child_env(self):
+        """DeoVR session for vr-play (environment, never on the command line)"""
+        env = dict(os.environ)
+        if self.deovr.get("login") and self.deovr.get("password"):
+            env["VR_DEOVR_LOGIN"] = self.deovr["login"]
+            env["VR_DEOVR_PASSWORD"] = self.deovr["password"]
+        return env
+
+    def deovr_flag(self, url):
+        """links of the DeoVR-compatible site chosen in the DeoVR window are read with the DeoVR API"""
+        site = url_host(self.cfg.get("deovr_site", "https://deovr.com"))
+        h = url_host(url)
+        return ["--deovr"] if h and site and (h == site or h.endswith("." + site)) else []
+
+    def analyze_url(self, url):
+        """what is this link? (title, size, 3D layout, VR) - vr-play --probe in the background"""
+        self.analyzed_url = url
+        self.kind.config(text=T("Consultando el vídeo online…", "Looking up the online video…"))
+        cmd = vrplay_cmd() + ["--probe", "--quality", self.quality_key()] + self.deovr_flag(url) + [url]
+        env = self.child_env()
+
+        def work():
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=150, env=env)
+                out = r.stdout.strip().splitlines()
+                info = json.loads(out[-1]) if out else None
+                err = (r.stderr.strip().splitlines() or [""])[-1] if not info else ""
+            except (OSError, ValueError, subprocess.SubprocessError) as ex:
+                info, err = None, str(ex)
+            self.q.put(("probe", (url, info, err)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_probe(self, url, info, err):
+        if url != self.path.get().strip():
+            return  # the user moved on
+        if not info:
+            self.kind.config(text=T("No se pudo leer el enlace: ", "Could not read the link: ") + (err or "?"))
+            if "yt-dlp" in (err or ""):
+                self.append(err + "\n")
+            return
+        what = FORMAT_NAMES.get(info.get("layout"), info.get("layout"))
+        pr = info.get("projection") or "flat"
+        if pr.startswith("fisheye"):
+            pr = "fisheye " + (pr.split(":")[1] if ":" in pr else "180")
+        if pr != "flat":
+            what = "VR %s° · %s" % (pr, "3D " + what if info["layout"] != "mono" else "2D")
+        elif info.get("layout") != "mono":
+            what = "3D " + what
+        size = "%dx%d" % (info.get("width") or 0, info.get("height") or 0) if info.get("width") else ""
+        if info.get("resolution"):
+            size = "%dp" % info["resolution"]
+        txt = " · ".join(x for x in (info.get("title"), size, what) if x)
+        if info.get("note"):
+            txt += T("  (sin indicios de 3D: elige el formato si es 3D)", "  (no sign of 3D: choose the format if it is 3D)")
+        self.kind.config(text=txt)
+
+    # ---- DeoVR ---------------------------------------------------------------------------------------
+    def open_deovr(self):
+        if self.deovr_win and self.deovr_win.winfo_exists():
+            self.deovr_win.lift()
+            return
+        w = tk.Toplevel(self.root)
+        self.deovr_win = w
+        w.title("DeoVR")
+        w.geometry(self.cfg.get("deovr_geometry", "620x560"))
+        f = ttk.Frame(w)
+        f.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(f, text=T("Web (DeoVR o compatible)", "Site (DeoVR or compatible)")).grid(row=0, column=0, sticky="w")
+        self.dv_site = ttk.Entry(f)
+        self.dv_site.insert(0, self.cfg.get("deovr_site", "https://deovr.com"))
+        self.dv_site.grid(row=0, column=1, columnspan=3, sticky="we", padx=6, pady=2)
+        ttk.Label(f, text=T("Usuario o email", "User or email")).grid(row=1, column=0, sticky="w")
+        self.dv_user = ttk.Entry(f)
+        self.dv_user.insert(0, self.deovr.get("login", ""))
+        self.dv_user.grid(row=1, column=1, sticky="we", padx=6, pady=2)
+        ttk.Label(f, text=T("Contraseña", "Password")).grid(row=2, column=0, sticky="w")
+        self.dv_pw = ttk.Entry(f, show="•")
+        self.dv_pw.insert(0, self.deovr.get("password", ""))
+        self.dv_pw.grid(row=2, column=1, sticky="we", padx=6, pady=2)
+        self.dv_pw.bind("<Return>", lambda e: self.deovr_login())
+        self.dv_remember = tk.BooleanVar(value=bool(self.cfg.get("deovr_remember")))
+        ttk.Checkbutton(f, text=T("Recordar (llavero del sistema)", "Remember (system keyring)"),
+                        variable=self.dv_remember).grid(row=3, column=1, columnspan=3, sticky="w", padx=6)
+        ttk.Button(f, text=T("Iniciar sesión", "Log in"), command=self.deovr_login).grid(row=1, column=2, sticky="we", padx=2)
+        ttk.Button(f, text=T("Cerrar sesión", "Log out"), command=self.deovr_logout).grid(row=2, column=2, sticky="we", padx=2)
+        ttk.Button(f, text=T("Ver catálogo", "Browse"), command=lambda: self.deovr_load(False)).grid(row=0, column=4, padx=2)
+        f.columnconfigure(1, weight=1)
+        self.dv_status = ttk.Label(w, text=self.deovr_state_text(), foreground="#2a6")
+        self.dv_status.pack(anchor="w", padx=10)
+        mid = ttk.Frame(w)
+        mid.pack(fill="both", expand=True, padx=10, pady=4)
+        self.dv_scene = ttk.Combobox(mid, state="readonly")
+        self.dv_scene.pack(fill="x")
+        self.dv_scene.bind("<<ComboboxSelected>>", lambda e: self.deovr_fill())
+        # search
+        sf = ttk.Frame(mid)
+        sf.pack(fill="x", pady=(6, 0))
+        ttk.Label(sf, text=T("Buscar", "Search")).pack(side="left")
+        self.dv_search = ttk.Entry(sf)
+        self.dv_search.pack(side="left", fill="x", expand=True, padx=6)
+        self.dv_search.bind("<KeyRelease>", lambda e: self.deovr_filter_later())
+        self.dv_search.bind("<Escape>", lambda e: (self.dv_search.delete(0, "end"), self.deovr_fill()))
+        self.dv_search.bind("<Return>", lambda e: self.deovr_fill())
+        ttk.Button(sf, text="✕", width=3, command=lambda: (self.dv_search.delete(0, "end"), self.deovr_fill())).pack(side="left")
+        self.dv_everywhere = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sf, text=T("en todas las categorías", "in all categories"), variable=self.dv_everywhere,
+                        command=self.deovr_fill).pack(side="left", padx=(6, 0))
+        self.dv_count = ttk.Label(mid, text="", foreground="#777")
+        self.dv_count.pack(anchor="w")
+        lf = ttk.Frame(mid)
+        lf.pack(fill="both", expand=True, pady=(4, 0))
+        self.dv_list = tk.Listbox(lf, activestyle="dotbox", exportselection=False)
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.dv_list.yview)
+        self.dv_list.configure(yscrollcommand=sb.set)
+        self.dv_list.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.dv_list.bind("<Double-Button-1>", lambda e: self.deovr_play())
+        self.dv_list.bind("<Return>", lambda e: self.deovr_play())
+        self.dv_list.bind("<<ListboxSelect>>", lambda e: self.deovr_select())
+        b = ttk.Frame(w)
+        b.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(b, text=T("▶ Reproducir en el visor", "▶ Play in the headset"), command=self.deovr_play).pack(side="right")
+        ttk.Label(b, text=T("También puedes pegar el enlace de un vídeo de DeoVR en la ventana principal.",
+                            "You can also paste a DeoVR video link in the main window."),
+                  foreground="#777").pack(side="left")
+        self.dv_data = None
+        w.protocol("WM_DELETE_WINDOW", self.deovr_close)
+        self.deovr_load(False)
+
+    def deovr_state_text(self):
+        if self.deovr.get("ok"):
+            return T("Sesión iniciada como ", "Logged in as ") + self.deovr["login"]
+        if self.deovr.get("login") and self.deovr.get("password"):
+            return T("Usuario guardado: ", "Saved user: ") + self.deovr["login"]
+        return T("Sin sesión (solo vídeos gratuitos)", "Not logged in (free videos only)")
+
+    def deovr_close(self):
+        self.cfg["deovr_site"] = self.dv_site.get().strip() or "https://deovr.com"
+        self.cfg["deovr_geometry"] = self.deovr_win.geometry()
+        self.save_cfg()
+        self.deovr_win.destroy()
+
+    def deovr_login(self):
+        user, pw = self.dv_user.get().strip(), self.dv_pw.get()
+        if not user or not pw:
+            messagebox.showerror("DeoVR", T("Escribe el usuario y la contraseña", "Enter user and password"), parent=self.deovr_win)
+            return
+        self.deovr.update({"login": user, "password": pw, "ok": False})
+        self.deovr_load(True)
+
+    def deovr_logout(self):
+        if self.deovr.get("login") and self.cfg.get("deovr_remember"):
+            keyring_delete(self.deovr["login"])
+        self.deovr.update({"password": "", "ok": False})
+        self.cfg["deovr_remember"] = False
+        self.dv_remember.set(False)
+        self.dv_pw.delete(0, "end")
+        self.save_cfg()
+        self.deovr_load(False)
+
+    def deovr_load(self, logging_in):
+        site = self.dv_site.get().strip() or "https://deovr.com"
+        if not re.match(r"^[a-z]+://", site):
+            site = "https://" + site
+        self.cfg["deovr_site"] = site
+        self.dv_status.config(text=T("Conectando con ", "Connecting to ") + site + "…", foreground="#2a6")
+        cmd = vrplay_cmd() + ["--deovr-list", site]
+        env = self.child_env()
+        self.dv_gen = getattr(self, "dv_gen", 0) + 1
+        gen = self.dv_gen
+
+        def work():
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+                data = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else None
+                err = "" if data else ((r.stderr.strip().splitlines() or ["?"])[-1])
+            except (OSError, ValueError, subprocess.SubprocessError) as ex:
+                data, err = None, str(ex)
+            self.q.put(("deovr", (gen, logging_in, data, err)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def deovr_loaded(self, gen, logging_in, data, err):
+        if not (self.deovr_win and self.deovr_win.winfo_exists()) or gen != self.dv_gen:
+            return  # window closed, or an older request answering late
+        if not data:
+            self.deovr["ok"] = False
+            self.dv_status.config(text=err, foreground="#c33")
+            if logging_in and "contrasena" in err:
+                self.deovr["password"] = ""
+            return
+        auth = data.get("authorized")
+        if self.deovr.get("password"):
+            self.deovr["ok"] = auth in (1, "1")
+            if logging_in:
+                if self.deovr["ok"]:
+                    self.cfg["deovr_login"] = self.deovr["login"]
+                    self.cfg["deovr_remember"] = bool(self.dv_remember.get())
+                    if self.dv_remember.get() and not keyring_set(self.deovr["login"], self.deovr["password"]):
+                        self.cfg["deovr_remember"] = False
+                        messagebox.showwarning("DeoVR", T("No hay llavero del sistema: la contraseña no se guarda (solo vale hasta "
+                                                          "cerrar la ventana). Instala python3-keyring o libsecret-tools.",
+                                                          "No system keyring: the password is not saved (only until you "
+                                                          "close the window). Install python3-keyring or libsecret-tools."),
+                                               parent=self.deovr_win)
+                    self.save_cfg()
+                else:
+                    messagebox.showwarning("DeoVR", T("La web no ha confirmado la sesión (puede que no admita iniciar "
+                                                      "sesión desde reproductores).", "The site did not confirm the login "
+                                                      "(it may not allow logging in from players)."), parent=self.deovr_win)
+        self.dv_status.config(text=self.deovr_state_text(), foreground="#2a6")
+        # prepare once: normalized titles for searching, labels, and the deduplicated "all" list
+        seen, everything = set(), []
+        for sc in data["scenes"]:
+            for it in sc["list"]:
+                n = int(it.get("length") or 0)
+                it["_label"] = it["title"] + ("  (%d:%02d:%02d)" % (n // 3600, n // 60 % 60, n % 60) if n else "")
+                it["_n"] = norm(it["title"])
+                key = (it["url"], it["title"])
+                if key not in seen:
+                    seen.add(key)
+                    everything.append(it)
+        self.dv_all = everything
+        self.dv_data = data
+        names = ["%s (%d)" % (sc["name"] or T("Vídeos", "Videos"), len(sc["list"])) for sc in data["scenes"]]
+        self.dv_scene.configure(values=names)
+        if names and self.dv_scene.current() < 0:
+            self.dv_scene.current(0)
+        self.deovr_fill()
+
+    def deovr_filter_later(self):
+        """search while typing, without filtering on every key press"""
+        if getattr(self, "dv_after", None):
+            self.root.after_cancel(self.dv_after)
+        self.dv_after = self.root.after(250, self.deovr_fill)
+
+    def deovr_fill(self):
+        self.dv_after = None
+        self.dv_list.delete(0, "end")
+        self.dv_shown = []
+        if not self.dv_data:
+            self.dv_count.config(text="")
+            return
+        words = norm(self.dv_search.get()).split()
+        c = self.dv_scene.current()
+        if c >= len(self.dv_data["scenes"]):
+            c = -1
+        src = self.dv_all if (c < 0 or (words and self.dv_everywhere.get())) else self.dv_data["scenes"][c]["list"]
+        shown = [it for it in src if all(wd in it["_n"] for wd in words)] if words else list(src)
+        self.dv_shown = shown
+        if shown:
+            self.dv_list.insert("end", *[it["_label"] for it in shown])
+        total = len(src)
+        self.dv_count.config(text=(T("%d vídeos", "%d videos") % total) if not words else
+                             (T("%d de %d vídeos", "%d of %d videos") % (len(shown), total)))
+
+    def deovr_item(self):
+        sel = self.dv_list.curselection()
+        if not sel or not getattr(self, "dv_shown", None):
+            return None
+        return self.dv_shown[sel[0]]
+
+    def deovr_select(self):
+        it = self.deovr_item()
+        if it:
+            self.path.set(it["url"])
+            self.analyze_url(it["url"]) if re.match(r"^[a-z]+://", it["url"]) else None
+
+    def deovr_play(self):
+        it = self.deovr_item()
+        if not it:
+            return
+        self.path.set(it["url"])
+        self.analyzed_url = it["url"]
+        self.play()
+
+    def update_ytdlp(self):
+        yt = os.path.expanduser("~/.local/bin/yt-dlp")
+        if not os.path.isfile(yt):
+            yt = shutil.which("yt-dlp")
+        if not yt or yt.startswith("/usr/"):
+            msg = T("Para YouTube hace falta un yt-dlp reciente en ~/.local/bin (el de la distribución suele estar viejo):\n\n"
+                    "mkdir -p ~/.local/bin\ncurl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp "
+                    "-o ~/.local/bin/yt-dlp\nchmod +x ~/.local/bin/yt-dlp",
+                    "YouTube needs a recent yt-dlp in ~/.local/bin (the distribution's is usually too old):\n\n"
+                    "mkdir -p ~/.local/bin\ncurl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp "
+                    "-o ~/.local/bin/yt-dlp\nchmod +x ~/.local/bin/yt-dlp")
+            if messagebox.askyesno("VR Video Player", msg + T("\n\n¿Lo descargo ahora?", "\n\nDownload it now?")):
+                self.run_logged(["sh", "-c", "mkdir -p ~/.local/bin && curl -fL "
+                                 "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp"
+                                 " && chmod +x ~/.local/bin/yt-dlp && ~/.local/bin/yt-dlp --version"])
+            return
+        self.run_logged([yt, "-U"])
+
+    def run_logged(self, cmd):
+        self.append("$ " + " ".join(cmd) + "\n")
+
+        def work():
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                self.q.put(("line", r.stdout + r.stderr))
+            except (OSError, subprocess.SubprocessError) as ex:
+                self.q.put(("line", str(ex) + "\n"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def describe(self, p):
+        if p.lower().endswith(".iso"):
+            return T("Imagen ISO de Blu-ray 3D", "3D Blu-ray ISO image")
+        n = os.path.basename(p).upper()
+        guess = ""
+        if any(k in n for k in ("HSBS", "H-SBS", "HALF-SBS", "HALF.SBS")):
+            guess = "Half SBS"
+        elif any(k in n for k in ("HOU", "H-OU", "HTAB", "HALF-OU")):
+            guess = T("Half arriba/abajo", "Half top/bottom")
+        elif any(k in n for k in ("FSBS", "FULL-SBS")):
+            guess = T("SBS completo", "Full SBS")
+        toks = [t for t in re.split(r"[^A-Z0-9]+", n) if t]
+        for t in toks:
+            if t in ("180", "VR180", "360", "VR360") or t.startswith(("180X", "360X")):
+                guess = "VR " + ("180°" if "180" in t else "360°")
+        for t in toks:
+            if guess.startswith("VR") and t in ("LR", "SBS", "3DH", "TB", "OU", "3DV", "MONO"):
+                guess += " · " + t
+        try:
+            size = fmt_size(os.path.getsize(p))
+        except OSError:
+            size = ""
+        return " · ".join(x for x in (T("Vídeo", "Video"), guess, size) if x)
+
+    def show_folder(self, d, select=True, highlight=None):
+        try:
+            names = sorted(os.listdir(d), key=lambda s: s.lower())
+        except OSError:
+            return
+        self.cur_folder = d
+        self.cfg["last_folder"] = d
+        self.folder_lbl.config(text=d)
+        self.lst.delete(0, "end")
+        self.items = []
+        dirs, files = [], []
+        for n in names:
+            if n.startswith("."):
+                continue
+            full = os.path.join(d, n)
+            if os.path.isdir(full):
+                dirs.append(full)
+            elif n.lower().endswith(VIDEO_EXT + (".iso",)):
+                files.append(full)
+        for full in dirs:
+            bd = is_bluray(full)
+            self.lst.insert("end", os.path.basename(full) + ("   [Blu-ray 3D]" if bd else "/"))
+            self.items.append(full)
+        for full in files:
+            self.lst.insert("end", os.path.basename(full) + ("   [ISO]" if full.lower().endswith(".iso") else ""))
+            self.items.append(full)
+        if highlight:
+            for i, it in enumerate(self.items):
+                if os.path.normpath(it) == os.path.normpath(highlight):
+                    self.lst.selection_set(i)
+                    self.lst.see(i)
+        if select and not highlight:
+            nvid = len(files)
+            self.kind.config(text=T("Carpeta: %d vídeo(s)", "Folder: %d video(s)") % nvid)
+
+    def list_select(self, _e=None):
+        sel = self.lst.curselection()
+        if not sel:
+            return
+        p = self.items[sel[0]]
+        self.path.set(p)
+        if os.path.isdir(p) and is_bluray(p):
+            self.kind.config(text=T("Blu-ray 3D (se reproduce el título principal en 3D)",
+                                    "3D Blu-ray (the main title plays in 3D)"))
+        elif os.path.isdir(p):
+            self.kind.config(text=T("Carpeta (doble clic para entrar)", "Folder (double click to open)"))
+        else:
+            self.kind.config(text=self.describe(p))
+
+    def folder_up(self):
+        d = getattr(self, "cur_folder", None)
+        if d:
+            parent = os.path.dirname(os.path.normpath(d))
+            if parent and parent != d:
+                self.show_folder(parent)
+
+    def play_folder(self):
+        d = getattr(self, "cur_folder", None)
+        if d:
+            self.path.set(d)
+            self.play()
+
+    # ---- playing -------------------------------------------------------------------------------
+    def play(self):
+        p = self.path.get().strip()
+        if not p:
+            self.pick_file()
+            p = self.path.get().strip()
+            if not p:
+                return
+        # double click on a normal folder: open it instead of playing it
+        sel = self.lst.curselection()
+        if (os.path.isdir(p) and not is_bluray(p) and sel and self.items[sel[0]] == p
+                and self.root.focus_get() == self.lst):
+            self.show_folder(p)
+            return
+        if not (os.path.exists(p) or re.match(r"^[a-z]+://", p)):
+            messagebox.showerror("VR Video Player", T("No existe:\n", "Not found:\n") + p)
+            return
+        if self.proc and self.proc.poll() is None:
+            if not messagebox.askyesno("VR Video Player", T("Ya se está reproduciendo algo. ¿Pararlo y empezar este?",
+                                                              "Something is already playing. Stop it and play this?")):
+                return
+            self.stop(wait=True)
+        cmd = vrplay_cmd()
+        pk = self.proj_key()
+        if pk != "auto":
+            cmd.append({"flat": "--flat", "180": "--180", "360": "--360", "fisheye": "--fisheye"}[pk])
+        fk = self.fmt_key()
+        if fk != "auto":
+            cmd.append({"sbs": "--full", "hsbs": "--half", "tab": "--tab", "htab": "--htab", "mono": "--2d"}[fk])
+        if self.swap.get():
+            cmd.append("--swap")
+        if self.rt_key() != "auto":
+            cmd += ["--runtime", self.rt_key()]
+        cmd.append("--vr-mode=" + self.mode_key())
+        if re.match(r"^[a-z]+://", p):
+            cmd += ["--quality", self.quality_key()] + self.deovr_flag(p)
+        for ent, opt in ((self.screen, "--vr-screen="), (self.dist, "--vr-distance=")):
+            v = ent.get().strip().replace(",", ".")
+            if v:
+                try:
+                    float(v)
+                    cmd.append(opt + v)
+                except ValueError:
+                    messagebox.showerror("VR Video Player", T("Número no válido: ", "Invalid number: ") + v)
+                    return
+        al = self.alang.get().strip()
+        if al:
+            cmd.append("--alang=" + al)
+        st = self.start.get().strip()
+        if st:
+            cmd.append("--start=" + st)
+        sub = self.sub.get().strip()
+        if sub:
+            cmd += ["--sub", sub]
+        cmd.append(p)
+        recent = [p] + [x for x in self.cfg.get("recent", []) if x != p]
+        self.cfg["recent"] = recent[:15]
+        self.path.configure(values=self.cfg["recent"])
+        self.save_cfg()
+        self.clear_log()
+        self.append("$ " + " ".join(cmd[1:]) + "\n")
+        kw = {}
+        if WINDOWS:
+            kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         text=True, bufsize=1, errors="replace", env=self.child_env(), **kw)
+        except OSError as e:
+            messagebox.showerror("VR Video Player", str(e))
+            return
+        threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+        self.play_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.status.config(text=T("Arrancando… ponte el visor", "Starting… put the headset on"))
+
+    def reader(self, proc):
+        for line in proc.stdout:
+            self.q.put(("line", line))
+        proc.wait()
+        self.q.put(("end", proc.returncode))
+
+    def stop(self, wait=False):
+        p = self.proc
+        if not p or p.poll() is not None:
+            return
+        try:
+            if WINDOWS:
+                p.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(p.pid, signal.SIGINT)  # vrvideo and vr-bd quit cleanly (ISO unmounted...)
+        except OSError:
+            pass
+        deadline = time.time() + (6 if wait else 0)
+        while wait and p.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        if wait and p.poll() is None:
+            try:
+                if WINDOWS:
+                    p.kill()
+                else:
+                    os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def poll(self):
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "probe":
+                    self.show_probe(*val)
+                    continue
+                if kind == "deovr":
+                    self.deovr_loaded(*val)
+                    continue
+                if kind == "line":
+                    s = val.rstrip("\n")
+                    if re.match(r"^\s*(\(Paused\) |\(Buffering\) )?(AV|A|V):", s):
+                        self.status.config(text=s.strip())
+                    elif s.strip():
+                        if "sesion VR iniciada" in s or "VR session started" in s:
+                            self.status.config(text=T("Reproduciendo en el visor", "Playing in the headset"))
+                        elif "esperando a que se conecte el visor" in s or "waiting for the headset" in s:
+                            self.status.config(text=T("Esperando al visor (abre WiVRn en el visor)…",
+                                                      "Waiting for the headset (open WiVRn in it)…"))
+                        self.append(s + "\n")
+                else:
+                    self.play_btn.config(state="normal")
+                    self.stop_btn.config(state="disabled")
+                    self.status.config(text=(T("Terminado", "Finished") if val in (0, None, -2, 130)
+                                             else T("Terminado con error (%s), mira el registro", "Ended with error (%s), see the log") % val))
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll)
+
+    def append(self, s):
+        self.log.config(state="normal")
+        self.log.insert("end", s)
+        if int(self.log.index("end-1c").split(".")[0]) > 2000:
+            self.log.delete("1.0", "500.0")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+    def clear_log(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+
+    def on_close(self):
+        self.save_cfg()
+        if self.proc and self.proc.poll() is None:
+            self.stop(wait=True)
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = App(root)
+    if len(sys.argv) > 1:
+        app.set_path(os.path.abspath(sys.argv[1]) if os.path.exists(sys.argv[1]) else sys.argv[1])
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

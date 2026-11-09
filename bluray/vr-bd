@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+# vr-bd - plays a decrypted 3D Blu-ray (BDMV folder or ISO) in real 3D in a VR headset (OpenXR:
+# WiVRn, SteamVR...), without re-encoding: vr-mvcdec decodes both eyes (H.264 MVC) to full SBS and
+# vrvideo (libmpv + OpenXR) shows each eye on the virtual screen, with the disc's own audio.
+# Ported from 3dvision-bd (3dvisionvideoplayer).
+#
+#   vr-bd       /ruta/PELICULA            carpeta del disco (la que contiene BDMV), BDMV o index.bdmv
+#   vr-bd       /ruta/DISCO.iso           imagen ISO del Blu-ray (se monta sola, solo lectura)
+#   vr-bd       --start 1:02:30 /ruta/... empezar en ese punto
+#   vr-bd       --list /ruta/...          solo mostrar que encuentra (playlist, clips, duracion)
+#   vr-bd       --swap ...                invertir ojos
+#   vr-bd       --alang=eng ...           idioma del audio (por defecto el del sistema; spa,eng = preferencias)
+#   Otras opciones --xxx se pasan a vrvideo/mpv (p. ej. --volume=80, --aid=2, --vr-screen=4).
+#
+# Teclas: flechas izq/der -/+10 s, arriba/abajo +/-1 min, RePag/AvPag +/-10 min, espacio pausa,
+# # cambia de pista de audio, q salir.
+#
+# Copyright (C) 2026 Artur Viader Mataix. GPLv3. Main-title detection ported from SyLC 3D Player
+# (https://github.com/5ymph0en1x/SyLC, src/sylc/bluray_disc.py, GPLv3).
+import glob
+import json
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+def _find(env, names, local):
+    if os.environ.get(env):
+        return os.environ[env]
+    for n in names:
+        if shutil.which(n):
+            return shutil.which(n)
+    for p in local:
+        if os.path.exists(p):
+            return p
+    return local[0]
+
+
+DECODER = _find("VR_MVCDEC", ["vr-mvcdec", "3dvision-mvcdec"],
+                [os.path.join(HERE, "build", "vr-mvcdec"), os.path.join(HERE, "vr-mvcdec")])
+PLAYER = _find("VRVIDEO", ["vrvideo"], [os.path.join(HERE, "..", "build", "vrvideo"), os.path.join(HERE, "vrvideo")])
+LUA = os.path.join(HERE, "vr-bd.lua")
+if not os.path.exists(LUA):
+    LUA = os.path.expanduser("~/.local/share/vrvideoplayer/vr-bd.lua")
+
+
+def log(msg):
+    print("vr-bd: " + msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# Disc structure (BDMV): find the 3D feature
+# ---------------------------------------------------------------------------------------------
+def resolve_bdmv_root(path):
+    path = os.path.abspath(path)
+    if os.path.isfile(path):
+        if os.path.basename(path).lower() in ("index.bdmv", "movieobject.bdmv"):
+            path = os.path.dirname(path)
+        else:
+            return None
+    d = path
+    for _ in range(4):
+        for cand in (d, os.path.join(d, "BDMV")):
+            if os.path.basename(cand).upper() == "BDMV" and os.path.isdir(os.path.join(cand, "PLAYLIST")):
+                return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def parse_mpls(path):
+    """{'duration','segments':[(clip,in45k,out45k)],'right_first','dep_clips':[...]} or None"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[0:4] != b"MPLS":
+            return None
+        pl = struct.unpack(">I", data[8:12])[0]
+        n_items = struct.unpack(">H", data[pl + 6:pl + 8])[0]
+        q = pl + 10
+        segs = []
+        for _ in range(n_items):
+            ln = struct.unpack(">H", data[q:q + 2])[0]
+            body = data[q + 2:q + 2 + ln]
+            if len(body) >= 20:
+                clip = body[0:5].decode("ascii", "replace")
+                t_in, t_out = struct.unpack(">II", body[12:20])
+                if t_out > t_in:
+                    segs.append((clip, t_in, t_out))
+            q += 2 + ln
+        # AppInfoPlayList flags: MVC_Base_view_R_flag (the AVC base view is the RIGHT eye)
+        right_first = False
+        app_len = struct.unpack(">I", data[40:44])[0]
+        if app_len >= 13 and 56 < pl:
+            right_first = bool(data[56] & 0x10)
+        return {"duration": sum(o - i for _, i, o in segs) / 45000.0, "segments": segs,
+                "right_first": right_first, "dep_clips": ss_dependent_clips(data),
+                "audio": first_item_audio(data, pl)}
+    except (OSError, struct.error, IndexError):
+        return None
+
+
+AUDIO_CODECS = {0x80: "LPCM", 0x81: "Dolby Digital", 0x82: "DTS", 0x83: "Dolby TrueHD", 0x84: "Dolby Digital Plus",
+                0x85: "DTS-HD HR", 0x86: "DTS-HD Master Audio", 0xA1: "DD+ (2a)", 0xA2: "DTS-HD (2a)"}
+
+
+def first_item_audio(data, pl):
+    """primary audio streams of the first PlayItem (STN_table): [(pid, lang, codec)] sorted by PID,
+    which is the order mpv lists the tracks of the .m2ts"""
+    try:
+        q = pl + 10
+        ln = struct.unpack(">H", data[q:q + 2])[0]
+        item = data[q + 2:q + 2 + ln]
+        p = 32
+        if item[10] & 0x10:  # is_multi_angle
+            n_angles = item[32]
+            p = 34 + (n_angles - 1) * 10
+        n_video, n_audio = item[p + 4], item[p + 5]
+        q = p + 16
+        out = []
+        for k in range(n_video + n_audio):
+            elen = item[q]
+            entry = item[q + 1:q + 1 + elen]
+            q += 1 + elen
+            alen = item[q]
+            attr = item[q + 1:q + 1 + alen]
+            q += 1 + alen
+            if k < n_video:
+                continue
+            pid = struct.unpack(">H", entry[1:3])[0] if entry and entry[0] == 1 else (
+                struct.unpack(">H", entry[3:5])[0] if len(entry) >= 5 else 0)
+            out.append((pid, attr[2:5].decode("ascii", "replace"), AUDIO_CODECS.get(attr[0], "audio")))
+        return sorted(out)
+    except (IndexError, struct.error):
+        return []
+
+
+ISO639 = {"es": "spa", "en": "eng", "fr": "fra", "de": "deu", "it": "ita", "pt": "por", "ca": "cat", "ja": "jpn",
+          "ru": "rus", "nl": "nld", "pl": "pol"}
+ALT = {"fra": "fre", "deu": "ger", "nld": "dut"}
+
+
+def pick_audio(tracks, wanted):
+    """mpv aid (1-based) of the first track in one of the wanted languages"""
+    for w in wanted:
+        for i, (_, lang, _) in enumerate(tracks):
+            if lang.lower() in (w, ALT.get(w, w)):
+                return i + 1
+    return None
+
+
+def ss_dependent_clips(data):
+    """Dependent-view clips from the MPLS ExtensionData (ID1=2/ID2=1, STN_table_SS)."""
+    try:
+        ext = struct.unpack(">I", data[16:20])[0]
+        if not (0 < ext < len(data) - 12):
+            return []
+        dbs = struct.unpack(">I", data[ext + 4:ext + 8])[0]
+        n = min(struct.unpack(">I", data[ext + 8:ext + 12])[0] & 0xFFFF, 64)
+        base = ext + 4 + dbs
+        off, clips = ext + 12, []
+        for _ in range(n):
+            if off + 12 > len(data):
+                break
+            id1, id2, st, ln = struct.unpack(">HHII", data[off:off + 12])
+            off += 12
+            if (id1, id2) != (2, 1):
+                continue
+            block = data[base + st:base + st + min(ln, 4096)]
+            k = 0
+            while True:
+                m = block.find(b"M2TS", k)
+                if m < 5:
+                    break
+                if block[m - 5:m].isdigit():
+                    clips.append(block[m - 5:m].decode())
+                k = m + 4
+        return clips
+    except (struct.error, IndexError):
+        return []
+
+
+def index_clips(directory, exts):
+    out = {}
+    if os.path.isdir(directory):
+        for f in os.listdir(directory):
+            stem, ext = os.path.splitext(f)
+            if ext.lower() in exts:
+                out[stem] = os.path.join(directory, f)
+    return out
+
+
+def find_feature(path):
+    """The longest real (not an anti-rip loop) 3D playlist -> list of segments
+    [{'video': ssif | 'base.m2ts:dep.m2ts', 'audio': base m2ts, 'duration': s}], info"""
+    bdmv = resolve_bdmv_root(path)
+    if not bdmv:
+        raise SystemExit("No es una carpeta de Blu-ray (no encuentro BDMV/PLAYLIST): " + path)
+    stream = os.path.join(bdmv, "STREAM")
+    ssif = index_clips(os.path.join(stream, "SSIF"), (".ssif",))
+    m2ts = index_clips(stream, (".m2ts", ".mts"))
+    playlists = []
+    seen = set()
+    for p in glob.glob(os.path.join(bdmv, "PLAYLIST", "*.mpls")) + glob.glob(os.path.join(bdmv, "PLAYLIST", "*.MPLS")):
+        if os.path.basename(p).lower() in seen:
+            continue
+        seen.add(os.path.basename(p).lower())
+        r = parse_mpls(p)
+        if r and r["duration"] > 0:
+            segs = r["segments"]
+            total = sum(o - i for _, i, o in segs)
+            unique = sum(o - i for _, i, o in set(segs))
+            r["decoy"] = len(segs) > 1 and unique > 0 and total > unique * 1.5
+            r["name"] = os.path.basename(p)
+            playlists.append(r)
+    # real playlists first, longest first; among equal ones prefer those with 3D pairing data
+    playlists.sort(key=lambda r: (r["decoy"], -round(r["duration"]), not r["dep_clips"]))
+    for r in playlists:
+        out = []
+        for i, (clip, t_in, t_out) in enumerate(r["segments"]):
+            dur = (t_out - t_in) / 45000.0
+            if clip in ssif:
+                out.append({"video": ssif[clip], "audio": m2ts.get(clip, ssif[clip]), "duration": dur, "clip": clip})
+                continue
+            dep = r["dep_clips"][i] if i < len(r["dep_clips"]) else None
+            if not dep and os.path.isdir(os.path.join(stream, "SSIF")):  # MakeMKV backup without .ssif
+                try:
+                    dep = "%05d" % (int(clip) + 1)
+                except ValueError:
+                    dep = None
+            if clip in m2ts and dep in m2ts:
+                out.append({"video": m2ts[clip] + ":" + m2ts[dep], "audio": m2ts[clip], "duration": dur,
+                            "clip": clip + "+" + dep})
+                continue
+            out = None
+            break
+        if out:
+            return out, {"bdmv": bdmv, "playlist": r["name"], "duration": r["duration"],
+                         "right_first": r["right_first"], "audio": r["audio"]}
+    raise SystemExit("No encuentro una pelicula 3D en el disco (ni .ssif ni pares de clips MVC).")
+
+
+# ---- frame-accurate seeking: the .clpi EP_map (+ the 3D extent map for .ssif files) ----------
+# ported from SyLC (src/sylc/mvc_decoder.py)
+class Bits:
+    def __init__(self, data, pos):
+        self.d, self.pos = data, pos * 8
+
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | ((self.d[self.pos >> 3] >> (7 - (self.pos & 7))) & 1)
+            self.pos += 1
+        return v
+
+    def skip(self, n):
+        self.pos += n
+
+
+def clpi_epmap(path):
+    """(pts_ms raw, byte offset in the .m2ts) of every base-view entry point"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[0:4] != b"HDMV":
+            return [], []
+        cpi = struct.unpack(">I", data[16:20])[0]
+        bs = Bits(data, cpi)
+        if bs.u(32) == 0:
+            return [], []
+        bs.skip(12); bs.u(4)
+        ep_start = bs.pos >> 3
+        bs.skip(8)
+        n_pid = bs.u(8)
+        entries = []
+        for _ in range(n_pid):
+            pid = bs.u(16); bs.skip(10); bs.u(4)
+            entries.append((pid, bs.u(16), bs.u(18), bs.u(32)))
+        if not entries:
+            return [], []
+        _, n_coarse, n_fine, addr = entries[0]
+        base = ep_start + addr
+        b = Bits(data, base)
+        fine_start = b.u(32)
+        coarse = [(b.u(18), b.u(14), b.u(32)) for _ in range(n_coarse)]
+        bf = Bits(data, base + fine_start)
+        fine = []
+        for _ in range(n_fine):
+            bf.u(1); bf.u(3)
+            fine.append((bf.u(11), bf.u(17)))
+        pts, byts = [], []
+        for ci, (ref, pc, sc) in enumerate(coarse):
+            nxt = coarse[ci + 1][0] if ci + 1 < len(coarse) else len(fine)
+            for fi in range(ref, min(nxt, len(fine))):
+                pf, sf = fine[fi]
+                pts.append(((((pc & ~1) << 18) + (pf << 8)) * 2) // 90)
+                byts.append(((sc & ~0x1FFFF) + sf) * 192)
+        return pts, byts
+    except (OSError, struct.error, IndexError):
+        return [], []
+
+
+def clpi_extent_starts(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if len(data) < 28 or data[0:4] != b"HDMV":
+            return []
+        ext = struct.unpack(">I", data[24:28])[0]
+        if ext == 0 or ext + 12 > len(data) or struct.unpack(">I", data[ext:ext + 4])[0] == 0:
+            return []
+        p = ext + 4 + 4 + 3
+        n = data[p]; p += 1
+        best = []
+        for _ in range(n):
+            if p + 12 > len(data):
+                break
+            off = ext + struct.unpack(">I", data[p + 4:p + 8])[0]
+            p += 12
+            for num_off in (off + 4, off):
+                if num_off + 4 > len(data):
+                    continue
+                num = struct.unpack(">I", data[num_off:num_off + 4])[0]
+                if num < 2 or num > 2000000 or num_off + 4 + num * 4 > len(data):
+                    continue
+                spns = list(struct.unpack(">%dI" % num, data[num_off + 4:num_off + 4 + num * 4]))
+                if all(spns[i] <= spns[i + 1] for i in range(num - 1)):
+                    if len(spns) > len(best):
+                        best = spns
+                    break
+        return best
+    except (OSError, struct.error, IndexError):
+        return []
+
+
+def write_seek_table(bdmv, seg, out_path):
+    """seek tables of one segment for vr-mvcdec --seek-table; False if none"""
+    import bisect
+    clip = seg["clip"].split("+")[0]
+    clipinf = os.path.join(bdmv, "CLIPINF")
+    base_clpi = os.path.join(clipinf, clip + ".clpi")
+    if not os.path.isfile(base_clpi):
+        return False
+    pts, byts = clpi_epmap(base_clpi)
+    if not pts:
+        return False
+    lines = ["B %d %d" % (p, b) for p, b in zip(pts, byts)]
+    if seg["video"].lower().endswith(".ssif"):
+        dep = "%05d" % (int(clip) + 1)
+        base_starts = clpi_extent_starts(base_clpi)
+        dep_starts = clpi_extent_starts(os.path.join(clipinf, dep + ".clpi"))
+        bm = os.path.join(bdmv, "STREAM", clip + ".m2ts")
+        dm = os.path.join(bdmv, "STREAM", dep + ".m2ts")
+        if len(base_starts) >= 2 and len(dep_starts) >= 2:
+            n = min(len(base_starts), len(dep_starts))
+            bt = os.path.getsize(bm) // 192 if os.path.isfile(bm) else None
+            dt = os.path.getsize(dm) // 192 if os.path.isfile(dm) else None
+
+            def ext_len(starts, j, total):
+                nxt = starts[j + 1] if j + 1 < len(starts) else (total if total else starts[j])
+                return max(0, nxt - starts[j])
+            cum = [0] * n
+            for j in range(1, n):
+                cum[j] = cum[j - 1] + ext_len(dep_starts, j - 1, dt) + ext_len(base_starts, j - 1, bt)
+            for p, b in zip(pts, byts):
+                j = bisect.bisect_right(base_starts, b // 192) - 1
+                if 0 <= j < n:
+                    lines.append("S %d %d" % (p, cum[j] * 192))
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return True
+
+
+def first_video_pts(bdmv, seg):
+    """absolute PTS (seconds) of the first base-view frame of a segment's clip: the decoder's timestamps
+    ("START <ms>") count from it. Read from the first PES of PID 0x1011, or else the CLPI EP_map."""
+    try:
+        with open(seg["audio"], "rb") as f:
+            data = f.read(32 << 20)
+        for o in range(0, len(data) - 192, 192):
+            pk = data[o + 4:o + 192]
+            if pk[0] != 0x47 or not (pk[1] & 0x40) or ((pk[1] & 0x1F) << 8 | pk[2]) != 0x1011:
+                continue
+            q = 4 + (1 + pk[4] if pk[3] & 0x20 else 0)
+            pes = pk[q:]
+            if pes[0:3] == b"\x00\x00\x01" and pes[7] & 0x80:
+                b = pes[9:14]
+                v = ((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1
+                return v / 90000.0
+    except (OSError, IndexError):
+        pass
+    clip = seg["clip"].split("+")[0]  # EP_map: same frame, ~5 ms resolution
+    pts, _ = clpi_epmap(os.path.join(bdmv, "CLIPINF", clip + ".clpi"))
+    return pts[0] / 1000.0 if pts else None
+
+
+def mount_iso(iso):
+    """mounts a Blu-ray ISO read-only with udisks (no root needed on a desktop session).
+    Returns (mount point, cleanup function)."""
+    if not shutil.which("udisksctl"):
+        raise SystemExit("Para abrir una ISO hace falta udisks2 (sudo apt install udisks2), o montala tu y "
+                         "pasa la carpeta")
+    out = subprocess.run(["udisksctl", "loop-setup", "-r", "-f", iso], capture_output=True, text=True)
+    dev = None
+    for w in out.stdout.replace(".", " ").split():
+        if w.startswith("/dev/loop"):
+            dev = w
+    if not dev:
+        raise SystemExit("No pude montar la ISO: " + (out.stderr or out.stdout).strip())
+    mnt = None
+    for _ in range(50):  # the desktop may automount it by itself
+        r = subprocess.run(["findmnt", "-n", "-o", "TARGET", "-S", dev], capture_output=True, text=True)
+        if r.stdout.strip():
+            mnt = r.stdout.strip().splitlines()[0]
+            break
+        subprocess.run(["udisksctl", "mount", "-b", dev, "-o", "ro"], capture_output=True, text=True)
+        time.sleep(0.2)
+    if not mnt:
+        subprocess.run(["udisksctl", "loop-delete", "-b", dev], capture_output=True)
+        raise SystemExit("No pude montar la ISO " + iso)
+    log("ISO montada en " + mnt)
+
+    def cleanup():
+        subprocess.run(["udisksctl", "unmount", "-b", dev], capture_output=True)
+        subprocess.run(["udisksctl", "loop-delete", "-b", dev], capture_output=True)
+    return mnt, cleanup
+
+
+def parse_time(t):
+    secs = 0.0
+    for part in t.split(":"):
+        secs = secs * 60 + float(part)
+    return secs
+
+
+def fmt_time(s):
+    s = int(max(0, s))
+    return "%d:%02d:%02d" % (s // 3600, s // 60 % 60, s % 60)
+
+
+# ---------------------------------------------------------------------------------------------
+# mpv control (JSON IPC)
+# ---------------------------------------------------------------------------------------------
+class Mpv:
+    def __init__(self, sock_path, proc=None):
+        self.sock = socket.socket(socket.AF_UNIX)
+        # vrvideo opens its control socket once the headset is connected and the VR session runs:
+        # wait as long as the player is alive (it may be waiting for WiVRn / the headset)
+        deadline = time.time() + 900
+        while True:
+            try:
+                self.sock.connect(sock_path)
+                break
+            except OSError:
+                if (proc is not None and proc.poll() is not None) or time.time() > deadline:
+                    raise SystemExit("el reproductor VR no arranco (mira los mensajes de vrvideo)")
+                time.sleep(0.1)
+        self.buf = b""
+        self.rid = 0
+        self.replies = {}
+        self.events = []
+        self.cv = threading.Condition()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        while True:
+            try:
+                data = self.sock.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                with self.cv:
+                    self.events.append({"event": "shutdown"})
+                    self.cv.notify_all()
+                return
+            self.buf += data
+            while b"\n" in self.buf:
+                line, self.buf = self.buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                with self.cv:
+                    if "request_id" in msg and "event" not in msg:
+                        self.replies[msg["request_id"]] = msg
+                    else:
+                        self.events.append(msg)
+                    self.cv.notify_all()
+
+    def command(self, *args, wait=True):
+        with self.cv:
+            self.rid += 1
+            rid = self.rid
+        try:
+            self.sock.sendall(json.dumps({"command": list(args), "request_id": rid}).encode() + b"\n")
+        except OSError:
+            return None
+        if not wait:
+            return None
+        with self.cv:
+            self.cv.wait_for(lambda: rid in self.replies or any(e.get("event") == "shutdown" for e in self.events), 5)
+            return self.replies.pop(rid, None)
+
+    def next_event(self, timeout):
+        with self.cv:
+            self.cv.wait_for(lambda: self.events, timeout)
+            return self.events.pop(0) if self.events else None
+
+
+# ---------------------------------------------------------------------------------------------
+def main():
+    args = sys.argv[1:]
+    start, swap, list_only, mpv_extra, path = 0.0, False, False, [], None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--start":
+            start = parse_time(args[i + 1]); i += 1
+        elif a.startswith("--start="):
+            start = parse_time(a.split("=", 1)[1])
+        elif a == "--swap":
+            swap = True
+        elif a.startswith("--alang="):
+            os.environ["VR_ALANG"] = a.split("=", 1)[1]
+        elif a == "--list":
+            list_only = True
+        elif a in ("-h", "--help"):
+            head = open(os.path.realpath(__file__)).read().split("\n# Copyright")[0].split("\n")[1:]
+            print("\n".join(l[2:] for l in head))
+            return
+        elif a.startswith("--"):
+            mpv_extra.append(a)
+        else:
+            path = a
+        i += 1
+    if not path:
+        raise SystemExit("uso: vr-bd [--start H:MM:SS] [--swap] [--list] CARPETA_DEL_BLURAY|DISCO.iso")
+    cleanups = []
+    try:
+        if path.lower().endswith(".iso") and os.path.isfile(path):
+            mnt, done = mount_iso(path)
+            cleanups.append(done)
+            path = mnt
+        run(path, start, swap, list_only, mpv_extra)
+    finally:
+        for c in cleanups:
+            c()
+
+
+def run(path, start, swap, list_only, mpv_extra):
+    segs, info = find_feature(path)
+    total = sum(s["duration"] for s in segs)
+    log("%s: playlist %s, %d segmento(s), %s, ojo base %s" % (info["bdmv"], info["playlist"], len(segs),
+        fmt_time(total), "derecho" if info["right_first"] else "izquierdo"))
+    for s in segs:
+        log("  %s  %s" % (fmt_time(s["duration"]), s["video"]))
+    tracks = info.get("audio") or []
+    if tracks:
+        log("pistas de audio (tecla # para cambiar):")
+        for i, (pid, lang, codec) in enumerate(tracks):
+            log("  %d: %s  %s" % (i + 1, lang, codec))
+    if list_only:
+        return
+    wanted = [w.strip().lower() for w in os.environ.get("VR_ALANG", "").split(",") if w.strip()]
+    loc = (os.environ.get("LANG") or "")[:2].lower()
+    if not wanted and loc in ISO639:
+        wanted = [ISO639[loc]]
+    aid = pick_audio(tracks, wanted)
+    if aid:
+        log("audio: pista %d (%s %s)" % (aid, tracks[aid - 1][1], tracks[aid - 1][2]))
+        mpv_extra = ["--aid=%d" % aid] + mpv_extra
+    if not os.path.exists(DECODER):
+        raise SystemExit("Falta vr-mvcdec (ejecuta ./install.sh)")
+    if not os.path.exists(PLAYER):
+        raise SystemExit("Falta vrvideo (ejecuta ./install.sh en vrvideoplayer)")
+
+    tmp = tempfile.mkdtemp(prefix="vrbd.")
+    log_dir = os.path.expanduser("~/.cache/vrvideoplayer")
+    os.makedirs(log_dir, exist_ok=True)
+    sock_path = os.path.join(tmp, "mpv.sock")
+    env = dict(os.environ)
+    # vrvideo takes mpv's options (libmpv) plus its own --vr-*; the 3D stream is always full SBS
+    mpv_cmd = [PLAYER, "--idle=yes", "--rebase-start-time=no", "--vr-layout=sbs",
+               "--cache=yes", "--demuxer-readahead-secs=2",
+               "--input-ipc-server=" + sock_path, "--title=3D Blu-ray",
+               "--log-file=" + os.path.join(log_dir, "vr-bd-player.log")]
+    if swap:
+        mpv_cmd.append("--vr-swap")
+    if os.path.exists(LUA):
+        mpv_cmd.append("--script=" + LUA)
+    mpv_proc = subprocess.Popen(mpv_cmd + mpv_extra, env=env)
+    mpv = Mpv(sock_path, mpv_proc)
+    mpv.command("observe_property", 1, "pause", wait=False)
+
+    state = {"dec": None, "base": 0.0, "gen": 0, "restarted": 0.0}
+    first_pts = {}
+
+    def play_from(t):
+        """(re)start decoding at absolute time t (seconds into the feature)"""
+        t = min(max(0.0, t), max(0.0, total - 5))
+        state["restarted"] = time.time()
+        if state["dec"]:
+            try:
+                state["dec"].kill()
+            except OSError:
+                pass
+            state["dec"].wait()
+        k, acc = 0, 0.0
+        while k < len(segs) - 1 and t >= acc + segs[k]["duration"]:
+            acc += segs[k]["duration"]; k += 1
+        within = t - acc
+        state["gen"] += 1
+        fifo = os.path.join(tmp, "video%d.y4m" % state["gen"])
+        os.mkfifo(fifo)
+        cmd = [DECODER, "--out", fifo, "--start-ms", str(int(within * 1000))]
+        table = os.path.join(tmp, "seek%d.txt" % k)
+        if within > 0 and (os.path.exists(table) or write_seek_table(info["bdmv"], segs[k], table)):
+            cmd += ["--seek-table", table]
+        if info["right_first"]:
+            cmd.append("--right-first")
+        cmd += [s["video"] for s in segs[k:]]
+        dec = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+        state["dec"] = dec
+        got = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            line = dec.stderr.readline()
+            if not line:
+                break
+            if line.startswith("START "):
+                got = int(line.split()[1]) / 1000.0
+                break
+            if line.startswith("ERROR"):
+                log(line.strip())
+        if got is None:
+            log("el decodificador no pudo empezar")
+            return False
+
+        def drain(f):  # keep reading its log so it never blocks (copy in ~/.cache/vrvideoplayer)
+            with open(os.path.join(log_dir, "vr-bd-dec.log"), "a") as lf:
+                for line in f:
+                    lf.write(line)
+                    if line.startswith("ERROR"):
+                        log(line.strip())
+        threading.Thread(target=drain, args=(dec.stderr,), daemon=True).start()
+
+        # audio: the same clips through an EDL, placed with absolute timestamps (mpv runs with
+        # --rebase-start-time=no). A file's "start" as ffmpeg sees it can be far from the first frame
+        # (stray early timestamps on some discs), so it is never used as the reference.
+        parts = []
+        for j in range(k, len(segs)):
+            p = segs[j]["audio"]
+            if p not in first_pts:
+                first_pts[p] = first_video_pts(info["bdmv"], segs[j])
+            e = "%%%d%%%s" % (len(p.encode()), p)
+            t0 = first_pts[p]
+            if t0 is not None:
+                skip = got if j == k else 0.0
+                e += ",start=%.3f,length=%.3f" % (t0 + skip, max(0.1, segs[j]["duration"] - skip))
+            parts.append(e)
+        state["base"] = acc + got
+        # audio-files is a path list (":" separated): "set" would cut "edl://..." at its colon;
+        # clear it and append the one item
+        mpv.command("change-list", "audio-files", "clr", "")
+        r = mpv.command("change-list", "audio-files", "append", "edl://" + ";".join(parts))
+        if r and r.get("error") not in (None, "success"):
+            log("mpv no acepto el audio: %s" % r.get("error"))
+        mpv.command("loadfile", fifo, "replace")
+        # the VR on-screen display shows the time in the whole movie, not in this decoder run
+        mpv.command("script-message", "vr-osd-base", "%.3f" % state["base"], "%.3f" % total, wait=False)
+        state["restarted"] = time.time()
+        log("reproduciendo desde %s" % fmt_time(state["base"]))
+        return True
+
+    if not play_from(start):
+        mpv.command("quit")
+    pending = 0.0
+    pending_at = 0.0
+    playing = True
+    try:
+        while True:
+            ev = mpv.next_event(0.1)
+            if pending and time.time() - pending_at > 0.35:  # several key presses -> one jump
+                r = mpv.command("get_property", "time-pos")
+                pos = state["base"] + float((r or {}).get("data") or 0.0)
+                play_from(pos + pending)
+                pending = 0.0
+            if not ev:
+                if mpv_proc.poll() is not None:
+                    break
+                continue
+            e = ev.get("event")
+            if e == "shutdown":
+                break
+            if e == "client-message":
+                a = ev.get("args") or []
+                if len(a) >= 2 and a[0] == "3dbd-seek":
+                    pending += float(a[1])
+                    pending_at = time.time()
+            elif (e == "end-file" and ev.get("reason") == "eof" and not pending
+                  and time.time() - state["restarted"] > 5):
+                mpv.command("quit", wait=False)
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if state["dec"] and state["dec"].poll() is None:
+            state["dec"].kill()
+        try:
+            mpv_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            mpv_proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
